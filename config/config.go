@@ -86,9 +86,11 @@ CopilotInvokeTimeoutSeconds int `yaml:"copilot_invoke_timeout_seconds"`
 // make before giving up and returning the issue to the queue.  Default: 3.
 CopilotInvokeMaxRetries int `yaml:"copilot_invoke_max_retries"`
 
-// FallbackIssueInvokePrompt is the body of the nudge comment posted on an
-// issue when the Copilot coding agent has not started within the timeout.
-// The following placeholders are expanded at runtime:
+// FallbackIssueInvokePrompt is the task prompt sent directly to the Copilot
+// API when the coding agent has not started within the timeout.  It is passed
+// to the same backend that powers the GitHub Agents tab and the
+// `gh agent-task create` command.  The following placeholders are expanded at
+// runtime:
 //
 //	{issue_number} — the issue number (e.g. 42)
 //	{issue_title}  — the issue title
