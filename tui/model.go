@@ -21,11 +21,12 @@ type Model struct {
 	width   int
 	height  int
 
-	queue   []*poller.State
-	coding  []*poller.State
-	review  []*poller.State
-	lastRun time.Time
-	lastErr error
+	queue    []*poller.State
+	coding   []*poller.State
+	review   []*poller.State
+	lastRun  time.Time
+	lastErr  error
+	lastWarn string // most recent non-fatal warning (e.g. Copilot assignment failure)
 
 	owner string
 	repo  string

@@ -26,11 +26,12 @@ type State struct {
 
 // Event is sent on the Events channel after every poll tick.
 type Event struct {
-	Queue   []*State
-	Coding  []*State
-	Review  []*State
-	LastRun time.Time
-	Err     error
+	Queue    []*State
+	Coding   []*State
+	Review   []*State
+	LastRun  time.Time
+	Err      error
+	Warnings []string // non-fatal warnings, e.g. Copilot assignment failures
 }
 
 // Poller orchestrates the Copilot workflow state machine.
@@ -74,9 +75,11 @@ func (p *Poller) tick(ctx context.Context) {
 	evt := Event{LastRun: time.Now()}
 
 	// Step 1: Queue → Coding.
-	if err := p.promoteFromQueue(ctx); err != nil {
+	warnings, err := p.promoteFromQueue(ctx)
+	if err != nil {
 		evt.Err = fmt.Errorf("promote from queue: %w", err)
 	}
+	evt.Warnings = warnings
 
 	// Step 2: Coding → Review (detect completed Copilot runs / PR ready).
 	if err := p.moveCodingToReview(ctx); err != nil && evt.Err == nil {
@@ -101,19 +104,19 @@ func (p *Poller) tick(ctx context.Context) {
 }
 
 // promoteFromQueue moves issues from ai-queue → ai-coding up to the concurrency limit.
-func (p *Poller) promoteFromQueue(ctx context.Context) error {
+func (p *Poller) promoteFromQueue(ctx context.Context) (warnings []string, err error) {
 	coding, err := p.gh.IssuesByLabel(ctx, p.cfg.LabelCoding)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	slots := p.cfg.MaxConcurrentIssues - len(coding)
 	if slots <= 0 {
-		return nil
+		return nil, nil
 	}
 
 	queued, err := p.gh.IssuesByLabel(ctx, p.cfg.LabelQueue)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	// Process oldest-first (lowest issue number = opened earliest).
 	sortIssuesAsc(queued)
@@ -122,17 +125,23 @@ func (p *Poller) promoteFromQueue(ctx context.Context) error {
 		issue := queued[i]
 		num := issue.GetNumber()
 		if err := p.gh.RemoveLabel(ctx, num, p.cfg.LabelQueue); err != nil {
-			return err
+			return warnings, err
 		}
 		if err := p.gh.AddLabel(ctx, num, p.cfg.LabelCoding); err != nil {
-			return err
+			return warnings, err
 		}
 		if err := p.gh.AssignCopilot(ctx, num); err != nil {
 			// Non-fatal – the copilot user may not exist in the repo.
-			log.Printf("warning: failed to assign copilot user to issue #%d: %v", num, err)
+			// Surface as a TUI warning so it remains visible in alt-screen mode.
+			msg := fmt.Sprintf(
+				"could not assign %q to issue #%d: %v — verify copilot_user in config.yaml",
+				p.cfg.CopilotUser, num, err,
+			)
+			log.Printf("warning: %s", msg)
+			warnings = append(warnings, msg)
 		}
 	}
-	return nil
+	return warnings, nil
 }
 
 // moveCodingToReview checks ai-coding issues and moves them to ai-review once
