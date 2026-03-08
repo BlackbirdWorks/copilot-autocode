@@ -18,9 +18,11 @@ const (
 
 	CopilotUser = "copilot"
 
-	// MaxStrikes is the number of consecutive CI-failure ticks before
-	// we post a review comment asking Copilot to fix the tests.
-	MaxStrikes = 3
+	// MaxFixAttempts is the maximum number of times the orchestrator will post
+	// a "@copilot please fix + confirm full completion" prompt before giving up
+	// and leaving the PR for human review.  On the very first CI failure the
+	// prompt is posted immediately; this counter simply caps the retry loop.
+	MaxFixAttempts = 3
 )
 
 // Client wraps the GitHub SDK client.

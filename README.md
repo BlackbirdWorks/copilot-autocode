@@ -18,8 +18,12 @@ through CI feedback and merging.
   before moving to review
 - **Merge-conflict handling** — posts `@copilot Please merge from main…` and
   waits for the agent to finish before re-evaluating
-- **3-Strikes CI AutoFix** — waits for a failure to appear on three consecutive
-  poll ticks before posting the failure logs to Copilot for a fix
+- **CI AutoFix loop (up to 3 attempts)** — on the first CI failure the
+  orchestrator immediately posts `@copilot please fix the tests and confirm you
+  fully completed the original issue`.  After the agent finishes, CI is
+  re-tested.  If it still fails, the prompt is posted again.  This repeats up
+  to **3 total prompts**; after that the PR is left in `ai-review` for human
+  inspection.
 - **Auto-approve & squash-merge** when all CI checks are green and the branch
   is up-to-date
 - **Graceful Ctrl-C shutdown** without corrupting any state

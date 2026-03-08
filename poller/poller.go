@@ -39,17 +39,17 @@ type Poller struct {
 	gh     *ghclient.Client
 	Events chan Event
 
-	mu      sync.Mutex
-	strikes map[int]int // issueNum -> consecutive CI-failure ticks
+	mu          sync.Mutex
+	fixAttempts map[int]int // issueNum -> number of fix prompts posted so far
 }
 
 // New creates a Poller ready to Start.
 func New(cfg *config.Config, gh *ghclient.Client) *Poller {
 	return &Poller{
-		cfg:     cfg,
-		gh:      gh,
-		Events:  make(chan Event, 1),
-		strikes: make(map[int]int),
+		cfg:         cfg,
+		gh:          gh,
+		Events:      make(chan Event, 1),
+		fixAttempts: make(map[int]int),
 	}
 }
 
@@ -212,8 +212,8 @@ func (p *Poller) processOne(ctx context.Context, issue *github.Issue) error {
 		if err := p.gh.PostComment(ctx, pr.GetNumber(), comment); err != nil {
 			return err
 		}
-		// Reset strikes for this issue since we're waiting for a new run.
-		p.setStrikes(num, 0)
+		// Reset fix-attempt counter: a new agent run is starting fresh.
+		p.setFixAttempts(num, 0)
 		return nil
 	}
 
@@ -233,25 +233,28 @@ func (p *Poller) processOne(ctx context.Context, issue *github.Issue) error {
 	}
 
 	if anyFail {
-		strikes := p.incStrikes(num)
-		if strikes >= ghclient.MaxStrikes {
-			// Post fix request.
-			runID, err := p.gh.FindFailedRunID(ctx, pr.GetHead().GetSHA())
-			if err != nil {
-				return err
-			}
-			logs := ""
-			if runID != 0 {
-				logs, _ = p.gh.FailedRunLogs(ctx, runID)
-			}
-			body := fmt.Sprintf(
-				"@copilot The following CI checks have been failing across multiple checks. Please fix the failing tests.\n\n%s",
-				logs,
-			)
-			if err := p.gh.PostReviewComment(ctx, pr.GetNumber(), body); err != nil {
-				return err
-			}
-			p.setStrikes(num, 0)
+		attempts := p.incFixAttempts(num)
+		if attempts > ghclient.MaxFixAttempts {
+			// All attempts exhausted; leave the PR for human review.
+			return nil
+		}
+		// Post the fix + full-completion confirmation request immediately.
+		runID, err := p.gh.FindFailedRunID(ctx, pr.GetHead().GetSHA())
+		if err != nil {
+			return err
+		}
+		logs := ""
+		if runID != 0 {
+			logs, _ = p.gh.FailedRunLogs(ctx, runID)
+		}
+		body := fmt.Sprintf(
+			"@copilot CI checks are failing (attempt %d of %d). "+
+				"Please fix the failing tests and confirm you have fully completed "+
+				"all requirements from the original issue.\n\n%s",
+			attempts, ghclient.MaxFixAttempts, logs,
+		)
+		if err := p.gh.PostReviewComment(ctx, pr.GetNumber(), body); err != nil {
+			return err
 		}
 		return nil
 	}
@@ -262,7 +265,7 @@ func (p *Poller) processOne(ctx context.Context, issue *github.Issue) error {
 	}
 
 	// Step 5: All CI green – approve and merge.
-	p.setStrikes(num, 0)
+	p.setFixAttempts(num, 0)
 	if err := p.gh.ApprovePR(ctx, pr.GetNumber()); err != nil {
 		// Non-fatal if we already approved.
 		if !strings.Contains(err.Error(), "already approved") &&
@@ -312,22 +315,22 @@ func (p *Poller) snapshot(ctx context.Context) ([]*State, []*State, []*State) {
 		reviewStates
 }
 
-// -- strike counter helpers --------------------------------------------------
+// -- fix-attempt counter helpers ---------------------------------------------
 
-func (p *Poller) incStrikes(issueNum int) int {
+func (p *Poller) incFixAttempts(issueNum int) int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.strikes[issueNum]++
-	return p.strikes[issueNum]
+	p.fixAttempts[issueNum]++
+	return p.fixAttempts[issueNum]
 }
 
-func (p *Poller) setStrikes(issueNum, n int) {
+func (p *Poller) setFixAttempts(issueNum, n int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if n == 0 {
-		delete(p.strikes, issueNum)
+		delete(p.fixAttempts, issueNum)
 	} else {
-		p.strikes[issueNum] = n
+		p.fixAttempts[issueNum] = n
 	}
 }
 
