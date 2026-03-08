@@ -21,6 +21,10 @@ var (
 	issueNumStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#aaaaaa"))
 	prNumStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#5a9fe8"))
 
+	// Status sub-line style: muted text shown below each item's title line,
+	// describing the current phase and next scheduled action.
+	statusLineStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#555555"))
+
 	// Status bar.
 	statusBarStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#888888")).
@@ -29,6 +33,10 @@ var (
 	errorStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#ff5555")).
 			Bold(true).
+			PaddingLeft(1)
+
+	warnStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#e4b800")).
 			PaddingLeft(1)
 
 	titleStyle = lipgloss.NewStyle().
