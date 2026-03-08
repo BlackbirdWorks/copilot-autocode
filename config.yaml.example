@@ -1,0 +1,15 @@
+# config.yaml.example — copy to config.yaml and fill in your values.
+
+# The GitHub repository owner (user or organisation name).
+github_owner: "my-org"
+
+# The GitHub repository name.
+github_repo: "my-repo"
+
+# Maximum number of issues that can be in the "ai-coding" state simultaneously.
+# Defaults to 3 if not set.
+max_concurrent_issues: 3
+
+# How often (in seconds) the orchestrator polls GitHub for state changes.
+# Minimum is 10 seconds.  Defaults to 45 seconds.
+poll_interval_seconds: 45
