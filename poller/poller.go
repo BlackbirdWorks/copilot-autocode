@@ -6,16 +6,18 @@ package poller
 import (
 	"context"
 	"fmt"
-	"log"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"log/slog"
+
 	"github.com/google/go-github/v68/github"
 
 	"github.com/BlackbirdWorks/copilot-autocode/config"
 	"github.com/BlackbirdWorks/copilot-autocode/ghclient"
+	"github.com/BlackbirdWorks/copilot-autocode/pkgs/logger"
 	"github.com/BlackbirdWorks/copilot-autocode/resolver"
 )
 
@@ -86,7 +88,7 @@ func (p *Poller) Start(ctx context.Context) {
 	go func() {
 		// Ensure labels exist before the first tick.
 		if err := p.gh.EnsureLabelsExist(ctx); err != nil {
-			log.Printf("warning: could not ensure labels exist: %v", err)
+			logger.Load(ctx).WarnContext(ctx, "could not ensure labels exist", slog.Any("err", err))
 		}
 
 		// Run once immediately in the background so the UI doesn't hang.
@@ -176,7 +178,8 @@ func (p *Poller) tick(ctx context.Context) {
 		wg.Go(func() {
 			local := make(map[int]*issueDisplayInfo)
 			if gErr := p.processCodingIssue(ctx, issue, local); gErr != nil {
-				log.Printf("warning: error processing coding issue #%d: %v", issue.GetNumber(), gErr)
+				logger.Load(ctx).ErrorContext(ctx, "error processing coding issue",
+					slog.Int("issue", issue.GetNumber()), slog.Any("err", gErr))
 			}
 			for k, v := range local {
 				entries <- diEntry{k, v}
@@ -189,7 +192,8 @@ func (p *Poller) tick(ctx context.Context) {
 		wg.Go(func() {
 			local := make(map[int]*issueDisplayInfo)
 			if gErr := p.processOne(ctx, issue, local); gErr != nil {
-				log.Printf("warning: error processing issue #%d: %v", issue.GetNumber(), gErr)
+				logger.Load(ctx).ErrorContext(ctx, "error processing issue",
+					slog.Int("issue", issue.GetNumber()), slog.Any("err", gErr))
 			}
 			for k, v := range local {
 				entries <- diEntry{k, v}
@@ -241,10 +245,8 @@ func (p *Poller) promoteFromQueue(
 		// was coding, we might find a PR already exists upon restart.
 		existingPR, err := p.gh.OpenPRForIssue(ctx, issue)
 		if err == nil && existingPR != nil {
-			log.Printf(
-				"issue #%d: found existing PR#%d; skipping invoke and entering coding flow",
-				num, existingPR.GetNumber(),
-			)
+			logger.Load(ctx).InfoContext(ctx, "found existing PR; skipping invoke and entering coding flow",
+				slog.Int("issue", num), slog.Int("pr", existingPR.GetNumber()))
 			if err := p.gh.SwapLabel(ctx, num, p.cfg.LabelQueue, p.cfg.LabelCoding); err != nil {
 				return err
 			}
@@ -259,7 +261,8 @@ func (p *Poller) promoteFromQueue(
 		prompt := FormatFallbackPrompt(p.cfg.FallbackIssueInvokePrompt, issue)
 		jobID, capiErr := p.gh.InvokeCopilotAgent(ctx, prompt, issue.GetTitle(), num, issue.GetHTMLURL())
 		if capiErr != nil {
-			log.Printf("warning: could not invoke copilot agent for issue #%d via CAPI: %v", num, capiErr)
+			logger.Load(ctx).ErrorContext(ctx, "could not invoke copilot agent via CAPI",
+				slog.Int("issue", num), slog.Any("err", capiErr))
 		}
 
 		// Post a silent tracking comment (no @-mention — the CAPI call above
@@ -275,7 +278,8 @@ func (p *Poller) promoteFromQueue(
 			comment += fmt.Sprintf("\n%s%s -->", ghclient.CopilotJobIDCommentMarker, jobID)
 		}
 		if err := p.gh.PostComment(ctx, num, comment); err != nil {
-			log.Printf("warning: could not post invoke tracking comment on issue #%d: %v", num, err)
+			logger.Load(ctx).ErrorContext(ctx, "could not post invoke tracking comment",
+				slog.Int("issue", num), slog.Any("err", err))
 		}
 	}
 	return nil
@@ -293,7 +297,8 @@ func (p *Poller) processCodingIssue(
 	num := issue.GetNumber()
 	pr, err := p.gh.OpenPRForIssue(ctx, issue)
 	if err != nil {
-		log.Printf("warning: could not look up PR for coding issue #%d: %v", num, err)
+		logger.Load(ctx).WarnContext(ctx, "could not look up PR for coding issue",
+			slog.Int("issue", num), slog.Any("err", err))
 	}
 	if pr != nil {
 		return p.processCodingPR(ctx, pr, num, displayInfo)
@@ -303,7 +308,8 @@ func (p *Poller) processCodingIssue(
 	// re-invoking the agent (avoids creating duplicate PRs).
 	mergedPR, mErr := p.gh.MergedPRForIssue(ctx, issue)
 	if mErr == nil && mergedPR != nil {
-		log.Printf("issue #%d: PR#%d was merged externally while in coding phase — closing issue", num, mergedPR.GetNumber())
+		logger.Load(ctx).InfoContext(ctx, "PR merged externally; closing issue",
+			slog.Int("issue", num), slog.Int("pr", mergedPR.GetNumber()))
 		displayInfo[num] = &issueDisplayInfo{
 			current:     "PR merged externally — closing issue",
 			pr:          mergedPR,
@@ -362,10 +368,11 @@ func (p *Poller) processDraftPR(
 		return nil
 	}
 	// Agent finished its draft push — promote unconditionally.
-	log.Printf("PR#%d: agent finished draft push (no active runs) — marking ready for review", pr.GetNumber())
+	logger.Load(ctx).InfoContext(ctx, "agent finished draft push; marking ready", slog.Int("pr", pr.GetNumber()))
 	if err := p.gh.MarkPRReady(ctx, pr); err != nil {
 		// Don't transition to review if PR stays draft — merge will fail.
-		log.Printf("warning: could not mark PR#%d as ready: %v — staying in coding", pr.GetNumber(), err)
+		logger.Load(ctx).WarnContext(ctx, "could not mark PR as ready; staying in coding",
+			slog.Int("pr", pr.GetNumber()), slog.Any("err", err))
 		displayInfo[num] = &issueDisplayInfo{
 			current:     "Agent completed but PR still draft — retrying",
 			next:        "Retry mark ready next poll",
@@ -391,6 +398,7 @@ func (p *Poller) nudgeSingleCodingIssue(
 	timeout time.Duration,
 ) error {
 	num := issue.GetNumber()
+	logger.Load(ctx).InfoContext(ctx, "nudgeSingleCodingIssue: starting check", slog.Int("issue", num))
 
 	displayInfo[num] = &issueDisplayInfo{
 		current: "Agent assigned, awaiting PR",
@@ -399,21 +407,29 @@ func (p *Poller) nudgeSingleCodingIssue(
 
 	codingAt, err := p.gh.CodingLabeledAt(ctx, num, p.cfg.LabelCoding)
 	if err != nil || codingAt.IsZero() {
+		logger.Load(ctx).InfoContext(ctx, "nudge check: coding label time is zero or error",
+			slog.Int("issue", num),
+			slog.Any("err", err),
+			slog.Time("codingAt", codingAt),
+		)
 		if err != nil {
-			log.Printf("warning: nudge check: could not determine coding label time for issue #%d: %v", num, err)
+			logger.Load(ctx).WarnContext(ctx, "nudge check: could not determine coding label time",
+				slog.Int("issue", num), slog.Any("err", err))
 		}
 		return nil
 	}
 
 	nudgeCount, err := p.gh.CountNudgesSince(ctx, num, codingAt)
 	if err != nil {
-		log.Printf("warning: nudge check: could not count nudges for issue #%d: %v", num, err)
+		logger.Load(ctx).WarnContext(ctx, "nudge check: could not count nudges",
+			slog.Int("issue", num), slog.Any("err", err))
 		return nil
 	}
 
 	lastNudge, err := p.gh.LastNudgeAt(ctx, num)
 	if err != nil {
-		log.Printf("warning: nudge check: could not fetch last nudge time for issue #%d: %v", num, err)
+		logger.Load(ctx).WarnContext(ctx, "nudge check: could not fetch last nudge time",
+			slog.Int("issue", num), slog.Any("err", err))
 		return nil
 	}
 
@@ -442,59 +458,19 @@ func (p *Poller) nudgeSingleCodingIssue(
 	}
 
 	if nudgeCount >= p.cfg.CopilotInvokeMaxRetries {
-		log.Printf("issue #%d: Copilot did not start after %d nudge attempt(s); returning to ai-queue",
-			num, nudgeCount)
-		displayInfo[num] = &issueDisplayInfo{
-			current:     fmt.Sprintf("No response after %d nudge(s) — returning to queue", nudgeCount),
-			agentStatus: "failed",
-		}
-		notice := fmt.Sprintf(
-			"⚠️ copilot-autocode: Copilot has not started after %d nudge attempt(s). "+
-				"Returning this issue to the queue for manual review. "+
-				"Check that the GitHub Copilot coding agent is enabled for this repository.",
-			nudgeCount,
-		)
-		if err := p.gh.PostComment(ctx, num, notice); err != nil {
-			log.Printf("warning: could not post exhaustion notice on issue #%d: %v", num, err)
-		}
-		return p.gh.SwapLabel(ctx, num, p.cfg.LabelCoding, p.cfg.LabelQueue)
+		return p.handleNudgeExhaustion(ctx, num, nudgeCount, displayInfo)
 	}
 
 	// Double check before invoking — a PR might have appeared since the last pass.
 	// OpenPRForIssue calls ensureTwoWayLink internally when it discovers a PR,
 	// so finding it here is sufficient to post the cross-link comments.
 	if pr, err := p.gh.OpenPRForIssue(ctx, issue); err == nil && pr != nil {
-		log.Printf("issue #%d: PR#%d found just before nudge; skipping nudge", num, pr.GetNumber())
+		logger.Load(ctx).InfoContext(ctx, "PR found just before nudge; skipping nudge",
+			slog.Int("issue", num), slog.Int("pr", pr.GetNumber()))
 		return nil
 	}
 
-	// Guard against re-invoking while the Copilot agent is already working.
-	// First, try to check the specific CAPI Job ID if we have one.
-	jobID, _ := p.gh.LatestCopilotJobID(ctx, num)
-	isAgentActive := false
-
-	if jobID != "" {
-		status, err := p.gh.GetCopilotJobStatus(ctx, jobID)
-		if err == nil && status != nil {
-			s := status.Status
-			if s == "in_progress" || s == "running" || s == "queued" || s == "requested" || s == "pending" {
-				isAgentActive = true
-			}
-		} else {
-			log.Printf("warning: could not fetch status for job %q: %v", jobID, err)
-			// fallback below
-		}
-	}
-
-	// Fallback to the repo-level workflow run check if we couldn't determine specific job status.
-	if !isAgentActive {
-		if active, aErr := p.gh.HasActiveCopilotRun(ctx); aErr == nil && active {
-			isAgentActive = true
-			log.Printf("issue #%d: active Copilot workflow run detected (repo-level fallback); skipping re-invocation", num)
-		}
-	}
-
-	if isAgentActive {
+	if p.isAgentActive(ctx, num) {
 		displayInfo[num] = &issueDisplayInfo{
 			current:     "Agent actively running — waiting",
 			next:        "Re-check next poll",
@@ -503,10 +479,44 @@ func (p *Poller) nudgeSingleCodingIssue(
 		return nil
 	}
 
-	log.Printf(
-		"issue #%d: no Copilot activity detected after %s; invoking agent via Copilot API (attempt %d of %d)",
-		num, timeout, nudgeCount+1, p.cfg.CopilotInvokeMaxRetries,
-	)
+	return p.requestNudge(ctx, issue, num, nudgeCount, timeout, displayInfo)
+}
+
+// isAgentActive returns true if either a specific Copilot Job is in progress
+// or a general repository-level Copilot run is active.
+func (p *Poller) isAgentActive(ctx context.Context, num int) bool {
+	// 1. Try to check the specific CAPI Job ID if we have one.
+	jobID, _ := p.gh.LatestCopilotJobID(ctx, num)
+	if jobID != "" {
+		status, err := p.gh.GetCopilotJobStatus(ctx, jobID)
+		if err == nil && status != nil {
+			s := status.Status
+			if s == "in_progress" || s == "running" || s == "queued" || s == "requested" || s == "pending" {
+				return true
+			}
+		} else {
+			logger.Load(ctx).WarnContext(ctx, "could not fetch status for job; falling back",
+				slog.String("job", jobID), slog.Any("err", err))
+		}
+	}
+
+	// 2. Fallback to the repo-level workflow run check.
+	if active, aErr := p.gh.HasActiveCopilotRun(ctx); aErr == nil && active {
+		logger.Load(ctx).InfoContext(ctx, "active Copilot workflow run detected; skipping re-invocation",
+			slog.Int("issue", num))
+		return true
+	}
+	return false
+}
+
+// requestNudge invokes the agent via the Copilot API and posts a tracking comment.
+func (p *Poller) requestNudge(
+	ctx context.Context, issue *github.Issue, num, nudgeCount int,
+	timeout time.Duration, displayInfo map[int]*issueDisplayInfo,
+) error {
+	logger.Load(ctx).InfoContext(ctx, "no Copilot activity detected; invoking agent via Copilot API",
+		slog.Int("issue", num), slog.Duration("timeout", timeout), slog.Int("attempt", nudgeCount+1))
+
 	displayInfo[num] = &issueDisplayInfo{
 		current: fmt.Sprintf(
 			"Invoking agent via Copilot API (attempt %d of %d)",
@@ -514,11 +524,14 @@ func (p *Poller) nudgeSingleCodingIssue(
 		),
 		next: "Waiting for response",
 	}
+
 	nudgeBody := FormatFallbackPrompt(p.cfg.FallbackIssueInvokePrompt, issue)
 	jobID, invokeErr := p.gh.InvokeCopilotAgent(ctx, nudgeBody, issue.GetTitle(), num, issue.GetHTMLURL())
 	if invokeErr != nil {
-		log.Printf("warning: could not invoke copilot agent for issue #%d via Copilot API: %v", num, invokeErr)
+		logger.Load(ctx).ErrorContext(ctx, "could not invoke copilot agent via Copilot API",
+			slog.Int("issue", num), slog.Any("err", invokeErr))
 	}
+
 	comment := fmt.Sprintf(
 		"copilot-autocode: agent task created for issue #%d (attempt %d of %d).\n%s",
 		num, nudgeCount+1, p.cfg.CopilotInvokeMaxRetries,
@@ -554,15 +567,12 @@ func (p *Poller) handleAgentTimeout(
 	}
 	continueCount, _ := cfg.countFn(ctx, pr.GetNumber())
 	if continueCount >= p.cfg.MaxAgentContinueRetries {
-		log.Printf(
-			"PR#%d: agent unresponsive on %s after %d attempt(s); returning to queue",
-			pr.GetNumber(), cfg.promptKind, continueCount,
-		)
+		logger.Load(ctx).InfoContext(ctx, "agent unresponsive; leaving PR in review",
+			slog.Int("pr", pr.GetNumber()), slog.String("kind", cfg.promptKind), slog.Int("attempts", continueCount))
 		_ = p.gh.PostComment(ctx, num, fmt.Sprintf(cfg.noticeFormat, continueCount))
-		_ = p.gh.SwapLabel(ctx, num, p.cfg.LabelReview, p.cfg.LabelQueue)
 		displayInfo[num] = &issueDisplayInfo{
 			current: fmt.Sprintf(
-				"Agent unresponsive after %d %s — returning to queue",
+				"Agent unresponsive after %d %s — left in review",
 				continueCount, cfg.statusVerb,
 			),
 			pr:          pr,
@@ -570,10 +580,10 @@ func (p *Poller) handleAgentTimeout(
 		}
 		return true
 	}
-	log.Printf(
-		"PR#%d: %s stuck for >%ds; nudging agent",
-		pr.GetNumber(), cfg.promptKind, p.cfg.CopilotInvokeTimeoutSeconds,
-	)
+	logger.Load(ctx).InfoContext(ctx, "agent stuck; nudging",
+		slog.Int("pr", pr.GetNumber()),
+		slog.String("kind", cfg.promptKind),
+		slog.Int("timeout", p.cfg.CopilotInvokeTimeoutSeconds))
 	_ = p.gh.PostComment(ctx, pr.GetNumber(), p.cfg.AgentContinuePrompt+"\n"+cfg.nudgeMarker)
 	return false
 }
@@ -592,6 +602,27 @@ func (p *Poller) handleMergeConflict(
 	}
 	if upToDate {
 		return false, nil
+	}
+
+	// Always prefer native GitHub "Update branch" if there are no explicit conflicts.
+	// If MergeableState is "dirty", we have real conflicts to solve.
+	// Otherwise, we attempt to sync from base via API first.
+	if pr.GetMergeableState() != "dirty" {
+		logger.Load(ctx).InfoContext(ctx, "branch is behind base; attempting native update",
+			slog.Int("pr", pr.GetNumber()))
+		displayInfo[num] = &issueDisplayInfo{
+			current:     "Updating branch from base",
+			next:        "Waiting for update",
+			pr:          pr,
+			agentStatus: "pending",
+		}
+		if err := p.gh.UpdatePRBranch(ctx, pr.GetNumber()); err != nil {
+			logger.Load(ctx).WarnContext(ctx, "failed to update PR branch",
+				slog.Int("pr", pr.GetNumber()), slog.Any("err", err))
+			// fallback to Copilot/Local AI if the API call itself fails
+		} else {
+			return true, nil // wait for the update to complete and trigger new CI
+		}
 	}
 
 	// Wait while the agent is already working on conflicts.
@@ -634,8 +665,10 @@ func (p *Poller) handleExhaustedMergeConflict(
 		return true, nil
 	}
 
-	log.Printf("PR#%d: %d merge-conflict @copilot attempt(s) exhausted; running local AI resolution via %q",
-		pr.GetNumber(), attempts, p.cfg.AIMergeResolverCmd)
+	logger.Load(ctx).InfoContext(ctx, "merge-conflict attempts exhausted; running local AI resolution",
+		slog.Int("pr", pr.GetNumber()),
+		slog.Int("attempts", attempts),
+		slog.String("resolver", p.cfg.AIMergeResolverCmd))
 	displayInfo[num] = &issueDisplayInfo{
 		current:     "Running local AI merge resolution",
 		next:        "Pushing resolved changes",
@@ -648,17 +681,18 @@ func (p *Poller) handleExhaustedMergeConflict(
 		HeadBranch: pr.GetHead().GetRef(),
 		BaseBranch: pr.GetBase().GetRef(),
 	}
-	if err := resolver.RunLocalResolution(ctx, p.token, prd, p.cfg); err != nil {
-		log.Printf("warning: local AI merge resolution failed for PR#%d: %v", pr.GetNumber(), err)
+	if err := resolver.New().RunLocalResolution(ctx, p.token, prd, p.cfg); err != nil {
+		logger.Load(ctx).ErrorContext(ctx, "local AI merge resolution failed",
+			slog.Int("pr", pr.GetNumber()), slog.Any("err", err))
 		notice := fmt.Sprintf(
-			"⚠️ copilot-autocode: local AI merge resolution via `%s` failed. "+
+			"copilot-autocode: local AI merge resolution via `%s` failed. "+
 				"Manual conflict resolution is required.\n%s",
 			p.cfg.AIMergeResolverCmd, ghclient.LocalResolutionCommentMarker)
 		_ = p.gh.PostComment(ctx, pr.GetNumber(), notice)
 		return true, nil
 	}
 	notice := fmt.Sprintf(
-		"ℹ️ Merge conflicts were resolved locally by copilot-autocode using `%s`.\n%s",
+		"copilot-autocode: Merge conflicts were resolved locally by copilot-autocode using `%s`.\n%s",
 		p.cfg.AIMergeResolverCmd, ghclient.LocalResolutionCommentMarker)
 	_ = p.gh.PostComment(ctx, pr.GetNumber(), notice)
 	return true, nil
@@ -681,7 +715,7 @@ func (p *Poller) requestMergeConflictFix(
 			countFn:      p.gh.CountMergeConflictContinueComments,
 			nudgeMarker:  ghclient.MergeConflictContinueCommentMarker,
 			promptKind:   "merge-conflict prompt",
-			noticeFormat: "⚠️ copilot-autocode: the Copilot coding agent became unresponsive while resolving merge conflicts and %d nudge(s) were exhausted. Returning this issue to the queue for manual review.",
+			noticeFormat: "copilot-autocode: the Copilot coding agent became unresponsive while resolving merge conflicts and %d nudge(s) were exhausted. The PR has been left open in review for manual inspection.",
 			statusVerb:   "nudges",
 		}
 		p.handleAgentTimeout(ctx, pr, num, lastActivity, mergeTimeoutCfg, displayInfo)
@@ -732,11 +766,14 @@ func (p *Poller) processRefinementCycle(
 			countFn:      p.gh.CountAgentContinueComments,
 			nudgeMarker:  ghclient.AgentContinueCommentMarker,
 			promptKind:   "refinement prompt",
-			noticeFormat: "⚠️ copilot-autocode: the Copilot coding agent became unresponsive and %d continue attempt(s) were exhausted. Returning this issue to the queue for manual review.",
+			noticeFormat: "copilot-autocode: the Copilot coding agent became unresponsive and %d continue attempt(s) were exhausted. The PR has been left open in review for manual inspection.",
 			statusVerb:   "retries",
 		}
 		if p.handleAgentTimeout(ctx, pr, num, lastActivity, refinementTimeoutCfg, displayInfo) {
-			return false, nil
+			// Agent is unresponsive to the refinement prompt.  Treat
+			// refinement as done so the flow continues to the CI-fix
+			// cycle (step 6.5), which posts a simpler, focused prompt.
+			return true, nil
 		}
 		displayInfo[num] = &issueDisplayInfo{
 			current:         fmt.Sprintf("Refinement %d/%d — waiting for agent", sent, p.cfg.MaxRefinementRounds),
@@ -774,7 +811,8 @@ func (p *Poller) handleMissingPR(
 ) error {
 	mergedPR, mErr := p.gh.MergedPRForIssue(ctx, issue)
 	if mErr == nil && mergedPR != nil {
-		log.Printf("issue #%d: PR#%d was manually merged. Closing issue automatically.", num, mergedPR.GetNumber())
+		logger.Load(ctx).InfoContext(ctx, "PR was manually merged; closing issue automatically",
+			slog.Int("issue", num), slog.Int("pr", mergedPR.GetNumber()))
 		displayInfo[num] = &issueDisplayInfo{
 			current:     "PR merged manually - closing issue",
 			pr:          mergedPR,
@@ -786,7 +824,7 @@ func (p *Poller) handleMissingPR(
 		return p.gh.CloseIssue(ctx, num)
 	}
 	// No PR at all — move back to coding so the nudge flow re-triggers.
-	log.Printf("issue #%d: in ai-review but no open PR found; moving back to ai-coding", num)
+	logger.Load(ctx).InfoContext(ctx, "no open PR found; moving back to ai-coding", slog.Int("issue", num))
 	displayInfo[num] = &issueDisplayInfo{
 		current:     "No PR found - returning to coding",
 		agentStatus: "failed",
@@ -830,11 +868,16 @@ func (p *Poller) processOne(
 	}
 
 	// ── Step 2: Approve action_required / waiting workflow runs ─────────────
-	requiredRuns, pending, err := p.processRequiredRuns(ctx, pr, num, sha)
+	requiredRuns, pending, err := p.processRequiredRuns(ctx, pr, sha)
 	if err != nil {
 		return err
 	}
 	if pending {
+		return nil
+	}
+
+	// ── Step 2.5: Check for unapproved deployment gates ──────────────────
+	if blocked := p.checkDeploymentGates(ctx, pr, num, sha, displayInfo); blocked {
 		return nil
 	}
 
@@ -888,10 +931,23 @@ func (p *Poller) processOne(
 		return p.mergeAndClose(ctx, pr, num, sent, displayInfo)
 	}
 
-	// Refinements exhausted but CI still failing — report as stuck.
+	// ── Step 6.5: CI-fix-only cycle (post-refinement) ────────────────────────
+	// Refinement rounds are exhausted but CI is still failing.  Keep posting
+	// CI-fix prompts (no review requirements) up to MaxCIFixRounds.
+	if anyFail {
+		ciDone, ciErr := p.processCIFixCycle(ctx, pr, num, sha, displayInfo)
+		if ciErr != nil {
+			return ciErr
+		}
+		if !ciDone {
+			return nil
+		}
+	}
+
+	// CI-fix rounds also exhausted — report as stuck.
 	displayInfo[num] = &issueDisplayInfo{
 		current: fmt.Sprintf(
-			"Refinements complete (%d/%d) — CI still failing",
+			"Refinements (%d/%d) and CI-fix rounds exhausted — CI still failing",
 			sent, p.cfg.MaxRefinementRounds,
 		),
 		pr:              pr,
@@ -902,36 +958,155 @@ func (p *Poller) processOne(
 	return nil
 }
 
-// processRequiredRuns approves any action_required workflow runs on the PR.
-// It returns the approved run list, a done=true flag when the caller should
-// exit early (retry limit hit), and any unexpected error.
-func (p *Poller) processRequiredRuns(
+// processCIFixCycle handles the CI-fix-only loop that runs after refinement
+// rounds are exhausted but CI is still failing.  It posts a prompt containing
+// only the failing workflow/job details (no review requirements) so the agent
+// can focus on fixing the tests.
+//
+// Returns (done=true, nil) when all CI-fix rounds are exhausted.
+// Returns (done=false, nil) when waiting for the agent or just after posting.
+func (p *Poller) processCIFixCycle(
 	ctx context.Context, pr *github.PullRequest, num int, sha string,
+	displayInfo map[int]*issueDisplayInfo,
+) (bool, error) {
+	ciFixSent, err := p.gh.CountCIFixPromptsSent(ctx, pr.GetNumber())
+	if err != nil {
+		return false, err
+	}
+	if ciFixSent >= p.cfg.MaxCIFixRounds {
+		return true, nil // all CI-fix rounds used
+	}
+
+	ciSHATag := ghclient.SHAMarker("ci-fix", sha)
+	alreadyPosted, postedAt, _ := p.gh.HasCommentContaining(ctx, pr.GetNumber(), ciSHATag)
+	if alreadyPosted {
+		lastContinue, _ := p.gh.LastAgentContinueAt(ctx, pr.GetNumber())
+		lastActivity := postedAt
+		if lastContinue.After(lastActivity) {
+			lastActivity = lastContinue
+		}
+		ciFixTimeoutCfg := agentTimeoutCfg{
+			countFn:      p.gh.CountAgentContinueComments,
+			nudgeMarker:  ghclient.AgentContinueCommentMarker,
+			promptKind:   "CI-fix prompt",
+			noticeFormat: "copilot-autocode: the Copilot coding agent became unresponsive during CI fixing and %d continue attempt(s) were exhausted. The PR has been left open in review for manual inspection.",
+			statusVerb:   "retries",
+		}
+		if p.handleAgentTimeout(ctx, pr, num, lastActivity, ciFixTimeoutCfg, displayInfo) {
+			return false, nil
+		}
+		displayInfo[num] = &issueDisplayInfo{
+			current:     fmt.Sprintf("CI-fix %d/%d — waiting for agent", ciFixSent, p.cfg.MaxCIFixRounds),
+			next:        "Waiting for agent to push",
+			pr:          pr,
+			agentStatus: "pending",
+		}
+		return false, nil
+	}
+
+	// Build a CI-fix-only prompt (no review requirements).
+	workflowName, failedJobs, err := p.gh.FailedRunDetails(ctx, sha)
+	if err != nil {
+		return false, err
+	}
+	body := fmt.Sprintf(
+		"@copilot (CI-fix %d of %d). The tests are still failing — please fix them.%s\n%s\n%s",
+		ciFixSent+1, p.cfg.MaxCIFixRounds,
+		BuildCIFailureSection(workflowName, failedJobs),
+		ghclient.CIFixCommentMarker,
+		ciSHATag,
+	)
+	if err := p.gh.PostComment(ctx, pr.GetNumber(), body); err != nil {
+		return false, err
+	}
+	ciFixSent++
+	displayInfo[num] = &issueDisplayInfo{
+		current:     fmt.Sprintf("CI-fix %d/%d posted — waiting for agent", ciFixSent, p.cfg.MaxCIFixRounds),
+		next:        "Waiting for agent to push",
+		pr:          pr,
+		agentStatus: "pending",
+	}
+	return false, nil
+}
+
+// checkDeploymentGates checks for workflow runs that have concluded with
+// action_required (environment deployment gates) which the orchestrator's
+// token cannot approve.  When such runs exist, it posts a one-time notice
+// and returns true so the caller skips the refinement/timeout flows.
+func (p *Poller) checkDeploymentGates(
+	ctx context.Context, pr *github.PullRequest, num int, sha string,
+	displayInfo map[int]*issueDisplayInfo,
+) bool {
+	depRuns, err := p.gh.ListPendingDeploymentRuns(ctx, sha)
+	if err != nil || len(depRuns) == 0 {
+		return false
+	}
+
+	// Collect workflow names for the notice.
+	var names []string
+	for _, r := range depRuns {
+		names = append(names, r.GetName())
+	}
+
+	displayInfo[num] = &issueDisplayInfo{
+		current:     "Waiting for manual deployment approval",
+		next:        fmt.Sprintf("Blocked by: %s", strings.Join(names, ", ")),
+		pr:          pr,
+		agentStatus: "pending",
+	}
+
+	// Post a one-time notice per SHA so we don't spam on every tick.
+	shaTag := ghclient.SHAMarker("deployment-pending", sha)
+	if posted, _, _ := p.gh.HasCommentContaining(ctx, pr.GetNumber(), shaTag); posted {
+		return true
+	}
+
+	notice := fmt.Sprintf(
+		"copilot-autocode: PR requires manual deployment approval for workflow(s): %s. "+
+			"Waiting for a reviewer to approve the environment deployment before proceeding.\n%s\n%s",
+		strings.Join(names, ", "),
+		ghclient.DeploymentPendingCommentMarker,
+		shaTag,
+	)
+	if err := p.gh.PostComment(ctx, pr.GetNumber(), notice); err != nil {
+		logger.Load(ctx).WarnContext(ctx, "could not post deployment-pending notice",
+			slog.Int("pr", pr.GetNumber()), slog.Any("err", err))
+	}
+	return true
+}
+
+// processRequiredRuns approves any action_required / pending-deployment workflow
+// runs on the PR.  It returns the approved run list, a done=true flag when the
+// caller should exit early (retry limit hit), and any unexpected error.
+func (p *Poller) processRequiredRuns(
+	ctx context.Context, pr *github.PullRequest, sha string,
 ) ([]*github.WorkflowRun, bool, error) {
+	// ── Fork-PR approval (status=action_required or status=waiting) ──────────
 	runs, err := p.gh.ListActionRequiredRuns(ctx, sha)
 	if err != nil {
 		return nil, false, err
 	}
 	for _, r := range runs {
 		runID := r.GetID()
-		log.Printf("PR#%d: approving workflow run %d (%s)", pr.GetNumber(), runID, r.GetName())
+		logger.Load(ctx).InfoContext(ctx, "approving workflow run",
+			slog.Int("pr", pr.GetNumber()), slog.Int64("run", runID), slog.String("name", r.GetName()))
 		if err := p.gh.ApproveWorkflowRun(ctx, runID); err != nil {
-			log.Printf("warning: failed to approve workflow run %d: %v", runID, err)
+			logger.Load(ctx).WarnContext(ctx, "failed to approve workflow run",
+				slog.Int64("run", runID), slog.Any("err", err))
 			p.mu.Lock()
 			p.approveRetries[runID]++
 			count := p.approveRetries[runID]
 			p.mu.Unlock()
 			if count >= p.cfg.MaxAgentContinueRetries {
-				log.Printf("PR#%d: failed to approve workflow run %d after %d retries; returning to queue",
-					pr.GetNumber(), runID, count)
+				logger.Load(ctx).InfoContext(ctx, "failed to approve workflow run after retries; leaving PR in review",
+					slog.Int("pr", pr.GetNumber()), slog.Int64("run", runID), slog.Int("count", count))
 				notice := fmt.Sprintf(
-					"⚠️ copilot-autocode: failed to automatically approve the GitHub Actions workflow run '%s' after %d retries. "+
-						"Returning to queue for manual review.",
+					"copilot-autocode: failed to automatically approve the GitHub Actions workflow run '%s' after %d retries. "+
+						"The PR has been left open in review for manual inspection.",
 					r.GetName(),
 					count,
 				)
 				_ = p.gh.PostComment(ctx, pr.GetNumber(), notice)
-				_ = p.gh.SwapLabel(ctx, num, p.cfg.LabelReview, p.cfg.LabelQueue)
 				return nil, true, nil
 			}
 		} else {
@@ -940,6 +1115,40 @@ func (p *Poller) processRequiredRuns(
 			p.mu.Unlock()
 		}
 	}
+
+	// ── Environment deployment approval (status=completed conclusion=action_required) ──
+	depRuns, err := p.gh.ListPendingDeploymentRuns(ctx, sha)
+	if err != nil {
+		return nil, false, err
+	}
+	for _, r := range depRuns {
+		runID := r.GetID()
+		logger.Load(ctx).InfoContext(ctx, "approving pending deployments for run",
+			slog.Int("pr", pr.GetNumber()), slog.Int64("run", runID), slog.String("name", r.GetName()))
+		approved, err := p.gh.ApprovePendingDeployments(ctx, runID)
+		switch {
+		case err != nil:
+			logger.Load(ctx).WarnContext(ctx, "failed to approve pending deployments",
+				slog.Int64("run", runID), slog.Any("err", err))
+		case approved == 0:
+			// No pending deployments — the action_required conclusion is
+			// likely stale or from a GitHub App check suite.  Re-run the
+			// workflow to clear the state and restart CI.
+			logger.Load(ctx).InfoContext(ctx, "no pending deployments found; re-running workflow to clear action_required",
+				slog.Int64("run", runID), slog.String("name", r.GetName()))
+			if rerr := p.gh.RerunWorkflow(ctx, runID); rerr != nil {
+				logger.Load(ctx).WarnContext(ctx, "failed to re-run workflow",
+					slog.Int64("run", runID), slog.Any("err", rerr))
+			} else {
+				runs = append(runs, r)
+			}
+		default:
+			logger.Load(ctx).InfoContext(ctx, "approved pending deployments",
+				slog.Int64("run", runID), slog.Int("count", approved))
+			runs = append(runs, r)
+		}
+	}
+
 	return runs, false, nil
 }
 
@@ -956,7 +1165,8 @@ func (p *Poller) mergeAndClose(
 		refinementMax:   p.cfg.MaxRefinementRounds,
 		agentStatus:     "success",
 	}
-	log.Printf("PR#%d: all checks passed and %d refinement(s) done — merging", pr.GetNumber(), sent)
+	logger.Load(ctx).InfoContext(ctx, "all checks passed and refinements done; merging",
+		slog.Int("pr", pr.GetNumber()), slog.Int("refinements", sent))
 	if err := p.gh.ApprovePR(ctx, pr.GetNumber()); err != nil {
 		if !strings.Contains(err.Error(), "already approved") &&
 			!strings.Contains(err.Error(), "Can not approve your own pull request") {
@@ -1007,20 +1217,16 @@ func (p *Poller) handleAgentFailure(
 
 	if continueCount >= p.cfg.MaxAgentContinueRetries {
 		// All continue attempts exhausted — return the issue to the queue.
-		log.Printf("PR#%d: agent timed out with %d continue attempt(s) exhausted; returning issue #%d to queue",
-			prNum, continueCount, issueNum)
+		logger.Load(ctx).InfoContext(ctx, "agent timed out; retries exhausted; returning to queue",
+			slog.Int("pr", prNum), slog.Int("attempts", continueCount), slog.Int("issue", issueNum))
 		notice := fmt.Sprintf(
-			"⚠️ copilot-autocode: the Copilot coding agent timed out and %d continue "+
-				"attempt(s) were exhausted. Returning this issue to the queue for manual review.",
+			"copilot-autocode: the Copilot coding agent timed out and %d continue "+
+				"attempt(s) were exhausted. The PR has been left open in review for manual inspection.",
 			continueCount,
 		)
 		_ = p.gh.PostComment(ctx, issueNum, notice)
-		// Remove both possible phase labels and add queue — uses SwapLabel
-		// from review if present, otherwise from coding.
-		_ = p.gh.SwapLabel(ctx, issueNum, p.cfg.LabelReview, p.cfg.LabelQueue)
-		_ = p.gh.RemoveLabel(ctx, issueNum, p.cfg.LabelCoding)
 		displayInfo[issueNum] = &issueDisplayInfo{
-			current:     fmt.Sprintf("Agent timed out after %d retries — returning to queue", continueCount),
+			current:     fmt.Sprintf("Agent timed out after %d retries — left in review", continueCount),
 			pr:          pr,
 			agentStatus: "failed",
 		}
@@ -1058,8 +1264,8 @@ func (p *Poller) handleAgentFailure(
 		return true, nil
 	}
 
-	log.Printf("PR#%d: agent timed out; posting continue (attempt %d of %d)",
-		prNum, continueCount+1, p.cfg.MaxAgentContinueRetries)
+	logger.Load(ctx).InfoContext(ctx, "agent timed out; posting continue",
+		slog.Int("pr", prNum), slog.Int("attempt", continueCount+1), slog.Int("max", p.cfg.MaxAgentContinueRetries))
 	displayInfo[issueNum] = &issueDisplayInfo{
 		current: fmt.Sprintf(
 			"Agent timed out — posting continue (%d of %d)",
@@ -1192,7 +1398,9 @@ func deduplicateIssueLists(queue, coding, reviewing []*github.Issue) ([]*github.
 		if _, dup := seen[i.GetNumber()]; !dup {
 			filtered = append(filtered, i)
 		} else {
-			log.Printf("warning: issue #%d appears in both coding and review lists; processing only in review", i.GetNumber())
+			// No context available here, just using slog.Default() for these non-critical background logs
+			slog.Default().Warn("issue appears in both coding and review lists; processing only in review",
+				slog.Int("issue", i.GetNumber()))
 		}
 	}
 	// Also remove from coding any issue still in queue (shouldn't happen
@@ -1206,7 +1414,9 @@ func deduplicateIssueLists(queue, coding, reviewing []*github.Issue) ([]*github.
 		if _, dup := queueSet[i.GetNumber()]; !dup {
 			deduped = append(deduped, i)
 		} else {
-			log.Printf("warning: issue #%d appears in both queue and coding lists; processing only in queue", i.GetNumber())
+			// No context available here
+			slog.Default().Warn("issue appears in both queue and coding lists; processing only in queue",
+				slog.Int("issue", i.GetNumber()))
 		}
 	}
 	return deduped, reviewing
@@ -1233,4 +1443,29 @@ func FormatFallbackPrompt(template string, issue *github.Issue) string {
 		"{issue_url}", issue.GetHTMLURL(),
 	)
 	return r.Replace(template)
+}
+
+func (p *Poller) handleNudgeExhaustion(
+	ctx context.Context, num, nudgeCount int,
+	displayInfo map[int]*issueDisplayInfo,
+) error {
+	logger.Load(ctx).InfoContext(ctx, "Copilot did not start after multiple nudges; returning to queue",
+		slog.Int("issue", num), slog.Int("nudges", nudgeCount))
+
+	displayInfo[num] = &issueDisplayInfo{
+		current:     fmt.Sprintf("No response after %d nudge(s) — returning to queue", nudgeCount),
+		agentStatus: "failed",
+	}
+
+	notice := fmt.Sprintf(
+		"copilot-autocode: Copilot has not started after %d nudge attempt(s). "+
+			"Returning this issue to the queue for manual review. "+
+			"Check that the GitHub Copilot coding agent is enabled for this repository.",
+		nudgeCount,
+	)
+	if err := p.gh.PostComment(ctx, num, notice); err != nil {
+		logger.Load(ctx).ErrorContext(ctx, "failed to post exhaustion notice",
+			slog.Int("issue", num), slog.Any("err", err))
+	}
+	return p.gh.SwapLabel(ctx, num, p.cfg.LabelCoding, p.cfg.LabelQueue)
 }

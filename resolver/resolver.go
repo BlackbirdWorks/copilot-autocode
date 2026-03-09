@@ -8,6 +8,7 @@ package resolver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -15,6 +16,23 @@ import (
 
 	"github.com/BlackbirdWorks/copilot-autocode/config"
 )
+
+// Runner defines the interface for executing system commands.
+type Runner interface {
+	Run(ctx context.Context, dir, token, name string, args ...string) error
+	Output(ctx context.Context, dir, name string, args ...string) (string, error)
+}
+
+// RealRunner implements Runner using [exec.Command].
+type RealRunner struct{}
+
+func (r *RealRunner) Run(ctx context.Context, dir, token, name string, args ...string) error {
+	return run(ctx, dir, token, name, args...)
+}
+
+func (r *RealRunner) Output(ctx context.Context, dir, name string, args ...string) (string, error) {
+	return output(ctx, dir, name, args...)
+}
 
 // PRDetails holds the clone-related information extracted from a GitHub PR.
 type PRDetails struct {
@@ -24,13 +42,28 @@ type PRDetails struct {
 	BaseBranch string // base branch to merge in (e.g. "main")
 }
 
+// Resolver handles the merge-conflict resolution process.
+type Resolver struct {
+	runner Runner
+}
+
+// New creates a new Resolver with the default real runner.
+func New() *Resolver {
+	return &Resolver{runner: &RealRunner{}}
+}
+
+// NewWithRunner creates a new Resolver with a custom runner (useful for testing).
+func NewWithRunner(r Runner) *Resolver {
+	return &Resolver{runner: r}
+}
+
 // RunLocalResolution clones the PR head branch into a fresh temp directory,
 // merges the base branch, invokes the configured AI CLI to resolve conflicts,
 // then commits and pushes the result.
 //
 // The GitHub token is used only for authenticated git operations and is
 // redacted from all returned error messages.
-func RunLocalResolution(ctx context.Context, token string, prd PRDetails, cfg *config.Config) error {
+func (r *Resolver) RunLocalResolution(ctx context.Context, token string, prd PRDetails, cfg *config.Config) error {
 	tmpDir, err := os.MkdirTemp("", "copilot-autocode-merge-*")
 	if err != nil {
 		return fmt.Errorf("create temp dir: %w", err)
@@ -43,7 +76,7 @@ func RunLocalResolution(ctx context.Context, token string, prd PRDetails, cfg *c
 		token, prd.Owner, prd.Repo)
 
 	// Clone only the head branch (shallow enough for speed, full for commit).
-	if err := run(ctx, tmpDir, token, "git", "clone",
+	if err := r.run(ctx, tmpDir, token, "git", "clone",
 		"--branch", prd.HeadBranch,
 		"--single-branch",
 		cloneURL, "."); err != nil {
@@ -51,18 +84,18 @@ func RunLocalResolution(ctx context.Context, token string, prd PRDetails, cfg *c
 	}
 
 	// Configure a git identity so the merge commit is accepted.
-	if err := run(
+	if err := r.run(
 		ctx, tmpDir, token,
 		"git", "config", "user.email", "copilot-autocode@users.noreply.github.com",
 	); err != nil {
 		return fmt.Errorf("git config user.email: %w", err)
 	}
-	if err := run(ctx, tmpDir, token, "git", "config", "user.name", "copilot-autocode"); err != nil {
+	if err := r.run(ctx, tmpDir, token, "git", "config", "user.name", "copilot-autocode"); err != nil {
 		return fmt.Errorf("git config user.name: %w", err)
 	}
 
 	// Fetch the base branch so we can merge it.
-	if err := run(ctx, tmpDir, token, "git", "fetch", "origin", prd.BaseBranch); err != nil {
+	if err := r.run(ctx, tmpDir, token, "git", "fetch", "origin", prd.BaseBranch); err != nil {
 		return fmt.Errorf("git fetch %s: %w", prd.BaseBranch, err)
 	}
 
@@ -70,21 +103,21 @@ func RunLocalResolution(ctx context.Context, token string, prd PRDetails, cfg *c
 	// any other class of failure (invalid ref, network error) is distinguishable
 	// because git prints a specific message — the AI CLI step will fail in that
 	// case and bubble up a meaningful error.
-	_ = run(ctx, tmpDir, token, "git", "merge", "--no-edit", "origin/"+prd.BaseBranch)
+	_ = r.run(ctx, tmpDir, token, "git", "merge", "--no-edit", "origin/"+prd.BaseBranch)
 
 	// Run the AI CLI in the working tree.
-	if err := run(ctx, tmpDir, token, cfg.AIMergeResolverCmd, cfg.AIMergeResolverPrompt); err != nil {
+	if err := r.run(ctx, tmpDir, token, cfg.AIMergeResolverCmd, cfg.AIMergeResolverPrompt); err != nil {
 		return fmt.Errorf("AI resolver %q: %w", cfg.AIMergeResolverCmd, err)
 	}
 
 	// Stage everything the AI may have written.
-	if err := run(ctx, tmpDir, token, "git", "add", "--all"); err != nil {
+	if err := r.run(ctx, tmpDir, token, "git", "add", "--all"); err != nil {
 		return fmt.Errorf("git add: %w", err)
 	}
 
 	// Verify the AI actually made changes — if nothing is staged the resolver
 	// did not resolve the conflicts and we should not create an empty commit.
-	statusOut, statusErr := output(ctx, tmpDir, "git", "diff", "--cached", "--name-only")
+	statusOut, statusErr := r.output(ctx, tmpDir, "git", "diff", "--cached", "--name-only")
 	if statusErr != nil {
 		return fmt.Errorf("git diff --cached: %w", statusErr)
 	}
@@ -94,13 +127,13 @@ func RunLocalResolution(ctx context.Context, token string, prd PRDetails, cfg *c
 	}
 
 	// Commit.
-	if err := run(ctx, tmpDir, token, "git", "commit",
+	if err := r.run(ctx, tmpDir, token, "git", "commit",
 		"-m", "chore: resolve merge conflicts via AI"); err != nil {
 		return fmt.Errorf("git commit: %w", err)
 	}
 
 	// Push the resolved branch back to origin.
-	if err := run(ctx, tmpDir, token, "git", "push", "origin", prd.HeadBranch); err != nil {
+	if err := r.run(ctx, tmpDir, token, "git", "push", "origin", prd.HeadBranch); err != nil {
 		return fmt.Errorf("git push: %w", err)
 	}
 
@@ -109,6 +142,22 @@ func RunLocalResolution(ctx context.Context, token string, prd PRDetails, cfg *c
 
 // run executes name+args in dir, captures combined output, and returns a
 // redacted error (token stripped) if the command fails.
+func (r *Resolver) run(ctx context.Context, dir, token, name string, args ...string) error {
+	err := r.runner.Run(ctx, dir, token, name, args...)
+	if err != nil {
+		// The error message itself might contain the token if the Runner returned it.
+		errMsg := redact(err.Error(), token)
+		return errors.New(errMsg)
+	}
+	return nil
+}
+
+// output runs name+args in dir and returns stdout as a string.
+func (r *Resolver) output(ctx context.Context, dir, name string, args ...string) (string, error) {
+	return r.runner.Output(ctx, dir, name, args...)
+}
+
+// run is the internal helper using [exec.Command].
 func run(ctx context.Context, dir, token, name string, args ...string) error {
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Dir = dir
@@ -120,8 +169,7 @@ func run(ctx context.Context, dir, token, name string, args ...string) error {
 	return nil
 }
 
-// output runs name+args in dir and returns stdout as a string.  It does not
-// take a token parameter because it is only used for innocuous status queries.
+// output is the internal helper using [exec.Command].
 func output(ctx context.Context, dir, name string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Dir = dir

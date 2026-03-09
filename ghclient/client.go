@@ -5,25 +5,28 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"net/url"
 	"regexp"
 	"strings"
 	"time"
 
+	"log/slog"
+
 	"github.com/google/go-github/v68/github"
 	"golang.org/x/oauth2"
 
 	"github.com/BlackbirdWorks/copilot-autocode/config"
+	"github.com/BlackbirdWorks/copilot-autocode/pkgs/logger"
 )
 
 const (
 	// RefinementCommentMarker is an invisible HTML comment embedded in every
 	// refinement prompt.  The orchestrator counts PR reviews containing this
-	// marker to determine how many refinement rounds have already been sent,
+	// marker to determine many refinement rounds have already been sent,
 	// which means the count survives process restarts.
 	RefinementCommentMarker = "<!-- copilot-autocode:refinement -->"
 
@@ -67,8 +70,20 @@ const (
 	// CopilotJobIDCommentMarker is embedded in the tracking comment posted
 	// after invoking the Copilot API.  It records the job/task ID returned
 	// by the API so the orchestrator can avoid duplicate invocations.
-	// Format: <!-- copilot-autocode:job-id:UUID -->
+	// Format: <!-- copilot-autocode:job-id:UUID -->.
 	CopilotJobIDCommentMarker = "<!-- copilot-autocode:job-id:"
+
+	// CIFixCommentMarker is an invisible HTML comment embedded in every
+	// CI-fix-only prompt posted after refinement rounds are exhausted but CI
+	// is still failing.  Counting these comments tells the orchestrator how
+	// many CI-fix attempts have been made.
+	CIFixCommentMarker = "<!-- copilot-autocode:ci-fix -->"
+
+	// DeploymentPendingCommentMarker is embedded in the one-time notice
+	// posted when a workflow run has conclusion=action_required (environment
+	// deployment gate) and the orchestrator's token cannot approve it.
+	// Combined with SHAMarker("deployment-pending", sha) for per-SHA dedup.
+	DeploymentPendingCommentMarker = "<!-- copilot-autocode:deployment-pending -->"
 )
 
 // FailedJobInfo describes a single failed CI job.
@@ -86,15 +101,16 @@ const copilotAPIVersion = "2026-01-09"
 
 // Pagination page sizes and other numeric constants used throughout the client.
 const (
-	prStateOpen        = "open"      // GitHub API state value for open issues and PRs
-	runStatusCompleted = "completed" // GitHub Actions workflow run status
-	perPageDefault     = 100         // default page size for most paginated list calls
-	perPageMedium      = 50          // page size for PR and commit list calls
-	perPageSmall       = 20          // page size for workflow run calls
-	perPageMin         = 10          // page size for small-result-set calls
-	maxLogRedirects    = 10          // maximum HTTP redirects when fetching job log URLs
-	housPerDay         = 24          // hours in a day, for relative timestamp formatting
-	shortSHALen        = 7           // number of chars used for a shortened commit SHA
+	prStateOpen              = "open"      // GitHub API state value for open issues and PRs
+	runStatusCompleted       = "completed" // GitHub Actions workflow run status
+	actionRequiredConclusion = "action_required"
+	perPageDefault           = 100 // default page size for most paginated list calls
+	perPageMedium            = 50  // page size for PR and commit list calls
+	perPageSmall             = 20  // page size for workflow run calls
+	perPageMin               = 10  // page size for small-result-set calls
+	maxLogRedirects          = 10  // maximum HTTP redirects when fetching job log URLs
+	housPerDay               = 24  // hours in a day, for relative timestamp formatting
+	shortSHALen              = 7   // number of chars used for a shortened commit SHA
 )
 
 // Client wraps the GitHub SDK client with the settings from Config.
@@ -109,12 +125,22 @@ type Client struct {
 	mergeMethod   string
 	mergeMsg      string
 	token         string // PAT used for Copilot API calls
+	transport     http.RoundTripper
 }
 
 // New creates a new Client authenticated with the provided PAT token.
 func New(token string, cfg *config.Config) *Client {
+	return NewWithTransport(token, cfg, nil)
+}
+
+// NewWithTransport creates a new Client with a custom [http.RoundTripper].
+func NewWithTransport(token string, cfg *config.Config, transport http.RoundTripper) *Client {
 	ts := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: token})
-	tc := oauth2.NewClient(context.Background(), ts)
+	ctx := context.Background()
+	if transport != nil {
+		ctx = context.WithValue(ctx, oauth2.HTTPClient, &http.Client{Transport: transport})
+	}
+	tc := oauth2.NewClient(ctx, ts)
 	return &Client{
 		gh:            github.NewClient(tc),
 		owner:         cfg.GitHubOwner,
@@ -126,6 +152,7 @@ func New(token string, cfg *config.Config) *Client {
 		mergeMethod:   cfg.MergeMethod,
 		mergeMsg:      cfg.MergeCommitMessage,
 		token:         token,
+		transport:     transport,
 	}
 }
 
@@ -144,6 +171,13 @@ func NewTestClient(owner, repo, token string) *Client {
 // used to point at an httptest server in unit tests.
 func NewTestClientWithGH(gh *github.Client, owner, repo string) *Client {
 	return &Client{gh: gh, owner: owner, repo: repo}
+}
+
+func (c *Client) httpClient() *http.Client {
+	if c.transport != nil {
+		return &http.Client{Transport: c.transport}
+	}
+	return http.DefaultClient
 }
 
 // IssuesByLabel returns all open issues carrying the given label.
@@ -214,8 +248,9 @@ func (c *Client) SwapLabel(ctx context.Context, issueNum int, oldLabel, newLabel
 		return fmt.Errorf("swap label: add %q: %w", newLabel, err)
 	}
 	if err := c.RemoveLabel(ctx, issueNum, oldLabel); err != nil {
-		log.Printf("warning: swap label: added %q but failed to remove %q on issue #%d: %v",
-			newLabel, oldLabel, issueNum, err)
+		logger.Load(ctx).ErrorContext(ctx, "swap label: added new but failed to remove old",
+			slog.String("added", newLabel), slog.String("removed", oldLabel),
+			slog.Int("issue", issueNum), slog.Any("err", err))
 	}
 	return nil
 }
@@ -270,91 +305,150 @@ func (c *Client) findLinkedPRFromComments(ctx context.Context, issueNum int) (in
 }
 
 // OpenPRForIssue finds the first open PR whose title or body references the issue.
+// It uses several discovery steps in order of reliability.
 func (c *Client) OpenPRForIssue(ctx context.Context, issue *github.Issue) (*github.PullRequest, error) {
 	issueNum := issue.GetNumber()
 
 	// 1. Check for explicit comment links on the ISSUE side first.
-	// This is our primary source of truth once a link is established.
-	// We still call ensureTwoWayLink in case the PR-side comment was missed.
-	linkedPRNum, err := c.findLinkedPRFromComments(ctx, issueNum)
-	if err != nil {
-		log.Printf("issue #%d: step 1 (comment links) error: %v", issueNum, err)
-	} else if linkedPRNum != 0 {
-		pr, _, err := c.gh.PullRequests.Get(ctx, c.owner, c.repo, linkedPRNum)
-		if err == nil && pr.GetState() == prStateOpen {
-			c.ensureTwoWayLink(ctx, issueNum, linkedPRNum)
-			return pr, nil
-		}
-		log.Printf("issue #%d: step 1 found linked PR #%d but it is not open (err=%v)", issueNum, linkedPRNum, err)
+	if pr, err := c.findPRByIssueComment(ctx, issueNum); err == nil && pr != nil {
+		return pr, nil
 	}
 
-	// 2. Search for the explicit link marker on the PR side.
-	// This helps discover PRs where the issue-side comment might be missing or delayed.
-	markerText := fmt.Sprintf("copilot-autocode:issue-link:%d", issueNum)
-	markerQuery := fmt.Sprintf("repo:%s/%s is:pr is:open %s", c.owner, c.repo, markerText)
-	markerResult, _, err := c.gh.Search.Issues(ctx, markerQuery, nil)
-	if err != nil {
-		log.Printf("issue #%d: step 2 (PR-side marker search) error: %v", issueNum, err)
-	} else if len(markerResult.Issues) > 0 {
-		sr := markerResult.Issues[0]
-		pr, _, err := c.gh.PullRequests.Get(ctx, c.owner, c.repo, sr.GetNumber())
-		if err == nil && pr.GetState() == prStateOpen {
-			c.ensureTwoWayLink(ctx, issueNum, pr.GetNumber())
-			return pr, nil
-		}
+	// 2. Proactive discovery via Copilot Job ID.
+	if pr := c.discoverPRViaJobID(ctx, issueNum); pr != nil {
+		return pr, nil
 	}
 
+	// 3. Search for the explicit link marker on the PR side.
+	if pr := c.findPRByMarkerComment(ctx, issueNum); pr != nil {
+		return pr, nil
+	}
+
+	// 4. Native GitHub Search by issue number (body/title/comments).
 	// Initial discovery (text-matching heuristics).
-	// branchRe matches Copilot branch naming conventions:
-	//   copilot/issue-373-description  ("issue" prefix)
-	//   copilot/373-description        (bare number)
-	//   copilot-swe-agent/issue-373/desc  (slash after number)
 	bodyRe := regexp.MustCompile(fmt.Sprintf(`(?i)#%d\b`, issueNum))
 	titleRe := regexp.MustCompile(fmt.Sprintf(`(?i)#%d\b`, issueNum))
 	branchRe := regexp.MustCompile(fmt.Sprintf(`(?i)(?:^|/)(?:issue-?)?%d(?:[-/]|$)`, issueNum))
 
-	// 3. Native GitHub Search by issue number (body/title/comments).
+	if pr := c.findPRBySearch(ctx, issueNum, bodyRe, titleRe, branchRe); pr != nil {
+		return pr, nil
+	}
+
+	// 5. Fallback: list recent PRs and look for issue number.
+	if pr := c.findPRByListing(ctx, issueNum, bodyRe, titleRe, branchRe); pr != nil {
+		return pr, nil
+	}
+
+	// 6. Issue timeline: scan for cross-reference events from a PR.
+	if pr, err := c.findPRFromTimeline(ctx, issueNum); err == nil && pr != nil {
+		c.ensureTwoWayLink(ctx, issueNum, pr.GetNumber())
+		return pr, nil
+	} else if err != nil {
+		logger.Load(ctx).ErrorContext(ctx, "issue step 6 error", slog.Int("issue", issueNum), slog.Any("err", err))
+	}
+
+	logger.Load(ctx).InfoContext(ctx, "OpenPRForIssue: no PR found after all 6 detection steps",
+		slog.Int("issue", issueNum))
+	return nil, nil
+}
+
+func (c *Client) findPRByIssueComment(ctx context.Context, issueNum int) (*github.PullRequest, error) {
+	linkedPRNum, err := c.findLinkedPRFromComments(ctx, issueNum)
+	if err != nil {
+		logger.Load(ctx).ErrorContext(ctx, "issue step 1 error", slog.Int("issue", issueNum), slog.Any("err", err))
+		return nil, err
+	}
+	if linkedPRNum == 0 {
+		return nil, nil
+	}
+	pr, _, err := c.gh.PullRequests.Get(ctx, c.owner, c.repo, linkedPRNum)
+	if err == nil && pr.GetState() == prStateOpen {
+		c.ensureTwoWayLink(ctx, issueNum, linkedPRNum)
+		return pr, nil
+	}
+	logger.Load(ctx).InfoContext(ctx, "issue step 1 found closed PR",
+		slog.Int("issue", issueNum), slog.Int("pr", linkedPRNum), slog.Any("err", err))
+	return nil, nil
+}
+
+func (c *Client) findPRByMarkerComment(ctx context.Context, issueNum int) *github.PullRequest {
+	markerText := fmt.Sprintf("copilot-autocode:issue-link:%d", issueNum)
+	markerQuery := fmt.Sprintf("repo:%s/%s is:pr is:open %s", c.owner, c.repo, markerText)
+	markerResult, _, err := c.gh.Search.Issues(ctx, markerQuery, nil)
+	if err != nil {
+		logger.Load(ctx).ErrorContext(ctx, "issue step 3 error", slog.Int("issue", issueNum), slog.Any("err", err))
+		return nil
+	}
+	if len(markerResult.Issues) == 0 {
+		return nil
+	}
+	sr := markerResult.Issues[0]
+	pr, _, err := c.gh.PullRequests.Get(ctx, c.owner, c.repo, sr.GetNumber())
+	if err == nil && pr.GetState() == prStateOpen {
+		c.ensureTwoWayLink(ctx, issueNum, pr.GetNumber())
+		return pr
+	}
+	return nil
+}
+
+func (c *Client) findPRBySearch(ctx context.Context, issueNum int,
+	bodyRe, titleRe, branchRe *regexp.Regexp) *github.PullRequest {
 	query := fmt.Sprintf("repo:%s/%s is:pr is:open %d", c.owner, c.repo, issueNum)
 	result, _, err := c.gh.Search.Issues(ctx, query, nil)
 	if err != nil {
-		log.Printf("issue #%d: step 3 (GitHub search) error: %v", issueNum, err)
-	} else {
-		if pr := c.findMatchInSearchResults(ctx, issueNum, result.Issues, bodyRe, titleRe, branchRe); pr != nil {
-			return pr, nil
-		}
-		log.Printf("issue #%d: step 3 returned %d search results, none matched", issueNum, len(result.Issues))
+		logger.Load(ctx).ErrorContext(ctx, "issue step 4 error", slog.Int("issue", issueNum), slog.Any("err", err))
+		return nil
 	}
+	if pr := c.findMatchInSearchResults(ctx, issueNum, result.Issues, bodyRe, titleRe, branchRe); pr != nil {
+		return pr
+	}
+	logger.Load(ctx).InfoContext(ctx, "issue step 4 no matches",
+		slog.Int("issue", issueNum), slog.Int("results", len(result.Issues)))
+	return nil
+}
 
-	// 4. Fallback: list recent PRs and look for issue number.
-	// This handles cases where the search index might be lagging for the very first PR push.
+func (c *Client) findPRByListing(ctx context.Context, issueNum int,
+	bodyRe, titleRe, branchRe *regexp.Regexp) *github.PullRequest {
 	prs, _, err := c.gh.PullRequests.List(ctx, c.owner, c.repo, &github.PullRequestListOptions{
 		State:       prStateOpen,
 		ListOptions: github.ListOptions{PerPage: perPageMedium},
 	})
 	if err != nil {
-		log.Printf("issue #%d: step 4 (list PRs) error: %v", issueNum, err)
-	} else {
-		for _, pr := range prs {
-			if isMatchForIssue(pr, bodyRe, titleRe, branchRe) {
-				c.ensureTwoWayLink(ctx, issueNum, pr.GetNumber())
-				return pr, nil
-			}
+		logger.Load(ctx).ErrorContext(ctx, "issue step 5 error", slog.Int("issue", issueNum), slog.Any("err", err))
+		return nil
+	}
+	for _, pr := range prs {
+		if isMatchForIssue(pr, bodyRe, titleRe, branchRe) {
+			c.ensureTwoWayLink(ctx, issueNum, pr.GetNumber())
+			return pr
 		}
-		log.Printf("issue #%d: step 4 listed %d open PRs, none matched body/title/branch regex", issueNum, len(prs))
 	}
+	logger.Load(ctx).InfoContext(ctx, "issue step 5 listed prs, none matched",
+		slog.Int("issue", issueNum), slog.Int("count", len(prs)))
+	return nil
+}
 
-	// 5. Issue timeline: scan for cross-reference events from a PR.
-	// This is authoritative for newly created PRs regardless of text matching
-	// or search-index lag — GitHub records the reference immediately.
-	if pr, err := c.findPRFromTimeline(ctx, issueNum); err == nil && pr != nil {
-		c.ensureTwoWayLink(ctx, issueNum, pr.GetNumber())
-		return pr, nil
-	} else if err != nil {
-		log.Printf("issue #%d: step 5 (timeline) error: %v", issueNum, err)
+func (c *Client) discoverPRViaJobID(ctx context.Context, issueNum int) *github.PullRequest {
+	jobID, _ := c.LatestCopilotJobID(ctx, issueNum)
+	if jobID == "" {
+		return nil
 	}
-
-	log.Printf("issue #%d: OpenPRForIssue: no PR found after all 5 detection steps", issueNum)
-	return nil, nil
+	status, err := c.GetCopilotJobStatus(ctx, jobID)
+	if err != nil || status == nil || status.PullRequest == nil {
+		return nil
+	}
+	prNum := status.PullRequest.Number
+	if prNum == 0 {
+		return nil
+	}
+	pr, _, err := c.gh.PullRequests.Get(ctx, c.owner, c.repo, prNum)
+	if err == nil && pr.GetState() == prStateOpen {
+		logger.Load(ctx).InfoContext(ctx, "proactive discovery via Job ID found PR",
+			slog.Int("issue", issueNum), slog.String("job", jobID), slog.Int("pr", prNum))
+		c.ensureTwoWayLink(ctx, issueNum, prNum)
+		return pr
+	}
+	return nil
 }
 
 // findPRFromTimeline scans the issue's timeline for cross-reference events
@@ -543,14 +637,47 @@ func (c *Client) MergePR(ctx context.Context, pr *github.PullRequest) error {
 	return err
 }
 
+// UpdatePRBranch updates the PR branch with latest changes from its base branch
+// using the GitHub native "Update branch" API.
+func (c *Client) UpdatePRBranch(ctx context.Context, prNum int) error {
+	_, resp, err := c.gh.PullRequests.UpdateBranch(ctx, c.owner, c.repo, prNum, nil)
+	if err != nil {
+		var acceptedErr *github.AcceptedError
+		if errors.As(err, &acceptedErr) {
+			logger.Load(ctx).InfoContext(ctx, "UpdatePRBranch: update scheduled (202 Accepted)", slog.Int("pr", prNum))
+			return nil
+		}
+		logger.Load(ctx).ErrorContext(ctx, "UpdatePRBranch: API error", slog.Int("pr", prNum), slog.Any("err", err))
+		return err
+	}
+	if resp != nil && resp.StatusCode == http.StatusAccepted {
+		logger.Load(ctx).InfoContext(ctx, "UpdatePRBranch: update scheduled (202 Accepted)", slog.Int("pr", prNum))
+		return nil
+	}
+	logger.Load(ctx).InfoContext(ctx, "UpdatePRBranch: update requested successfully",
+		slog.Int("pr", prNum), slog.String("status", resp.Status))
+	return nil
+}
+
 // LatestWorkflowRun returns all recent workflow runs for the given commit SHA.
 func (c *Client) LatestWorkflowRun(ctx context.Context, sha string) ([]*github.WorkflowRun, error) {
+	logger.Load(ctx).InfoContext(ctx, "Listing workflow runs", slog.String("sha", sha))
 	runs, _, err := c.gh.Actions.ListRepositoryWorkflowRuns(ctx, c.owner, c.repo, &github.ListWorkflowRunsOptions{
 		HeadSHA:     sha,
-		ListOptions: github.ListOptions{PerPage: perPageSmall},
+		ListOptions: github.ListOptions{PerPage: perPageDefault},
 	})
 	if err != nil {
 		return nil, err
+	}
+	logger.Load(ctx).InfoContext(ctx, "Found workflow runs",
+		slog.String("sha", sha), slog.Int("count", len(runs.WorkflowRuns)))
+	for _, r := range runs.WorkflowRuns {
+		logger.Load(ctx).InfoContext(ctx, "Workflow run details",
+			slog.Int64("id", r.GetID()),
+			slog.String("name", r.GetName()),
+			slog.String("status", r.GetStatus()),
+			slog.String("conclusion", r.GetConclusion()),
+		)
 	}
 	return runs.WorkflowRuns, nil
 }
@@ -676,9 +803,22 @@ func (c *Client) AllRunsSucceeded(ctx context.Context, sha string) (bool, bool, 
 
 		// If any run finished with a failure, we flag it immediately
 		// so the agent can start fixing it while others are still running.
+		// "action_required" is excluded from anyFailure because it requires
+		// human action (deployment gate, GitHub App check), not something
+		// Copilot can fix — including it would generate CI-fix prompts that
+		// cause an infinite refinement loop.  However, it still blocks
+		// allSuccess so the PR won't be merged while it's pending.
 		if status == runStatusCompleted &&
-			(conclusion != "success" && conclusion != "skipped" && conclusion != "neutral") {
+			(conclusion != "success" && conclusion != "skipped" &&
+				conclusion != "neutral" && conclusion != actionRequiredConclusion) {
 			anyFailure = true
+			allSuccess = false
+		}
+
+		// action_required blocks merge but doesn't count as a CI failure
+		// the agent can fix.  Steps 2/2.5 in processOne handle it by
+		// re-running the workflow or posting a notice; this is defense-in-depth.
+		if status == runStatusCompleted && conclusion == actionRequiredConclusion {
 			allSuccess = false
 		}
 
@@ -718,8 +858,15 @@ func (c *Client) LatestFailedRunConclusion(ctx context.Context, sha string) (str
 }
 
 // ListActionRequiredRuns returns all workflow runs for the given SHA that are
-// currently stuck in either the "action_required" or "waiting" status.
-// These typically require manual approval to proceed (e.g., from outside collaborators).
+// pending manual approval via the GitHub fork-PR approval mechanism.
+// This covers two pending statuses that can be unblocked by calling
+// ApproveWorkflowRun:
+//   - status="action_required": first-run from a fork PR awaiting approval.
+//   - status="waiting": environment protection rule awaiting a reviewer.
+//
+// Note: status="completed" conclusion="action_required" is a different state —
+// it means the run has pending environment deployments; use
+// ApprovePendingDeployments for those.
 func (c *Client) ListActionRequiredRuns(ctx context.Context, sha string) ([]*github.WorkflowRun, error) {
 	runs, err := c.LatestWorkflowRun(ctx, sha)
 	if err != nil {
@@ -735,12 +882,84 @@ func (c *Client) ListActionRequiredRuns(ctx context.Context, sha string) ([]*git
 	return required, nil
 }
 
+// ListPendingDeploymentRuns returns workflow runs for the given SHA that have
+// concluded with "action_required", which means one or more environment
+// protection rules are awaiting review approval.  These are approved via
+// ApprovePendingDeployments, not the fork-PR approve endpoint.
+func (c *Client) ListPendingDeploymentRuns(ctx context.Context, sha string) ([]*github.WorkflowRun, error) {
+	runs, err := c.LatestWorkflowRun(ctx, sha)
+	if err != nil {
+		return nil, err
+	}
+	var required []*github.WorkflowRun
+	for _, r := range runs {
+		if r.GetStatus() == runStatusCompleted && r.GetConclusion() == "action_required" {
+			required = append(required, r)
+		}
+	}
+	return required, nil
+}
+
+// ApprovePendingDeployments approves all environment deployments that the
+// current token is allowed to approve for the given workflow run.  It returns
+// the number of environments that were approved.
+func (c *Client) ApprovePendingDeployments(ctx context.Context, runID int64) (int, error) {
+	pending, _, err := c.gh.Actions.GetPendingDeployments(ctx, c.owner, c.repo, runID)
+	if err != nil {
+		return 0, fmt.Errorf("get pending deployments for run %d: %w", runID, err)
+	}
+	logger.Load(ctx).InfoContext(ctx, "pending deployments for run",
+		slog.Int64("run", runID), slog.Int("count", len(pending)))
+	var envIDs []int64
+	for _, d := range pending {
+		env := d.GetEnvironment()
+		logger.Load(ctx).InfoContext(ctx, "pending deployment",
+			slog.Int64("run", runID),
+			slog.String("env", env.GetName()),
+			slog.Int64("env_id", env.GetID()),
+			slog.Bool("can_approve", d.GetCurrentUserCanApprove()),
+		)
+		if d.GetCurrentUserCanApprove() {
+			envIDs = append(envIDs, env.GetID())
+		}
+	}
+	if len(envIDs) == 0 {
+		return 0, nil
+	}
+	_, _, err = c.gh.Actions.PendingDeployments(ctx, c.owner, c.repo, runID, &github.PendingDeploymentsRequest{
+		EnvironmentIDs: envIDs,
+		State:          "approved",
+		Comment:        "Auto-approved by copilot-autocode",
+	})
+	if err != nil {
+		return 0, fmt.Errorf("approve pending deployments for run %d: %w", runID, err)
+	}
+	return len(envIDs), nil
+}
+
+// RerunWorkflow re-runs an entire workflow run.  This is used when a run is
+// stuck in conclusion=action_required with no pending deployments — the
+// action_required state is likely stale or from a GitHub App check suite, so
+// re-running the workflow clears it and restarts CI from scratch.
+func (c *Client) RerunWorkflow(ctx context.Context, runID int64) error {
+	_, err := c.gh.Actions.RerunWorkflowByID(ctx, c.owner, c.repo, runID)
+	if err != nil {
+		return fmt.Errorf("rerun workflow run %d: %w", runID, err)
+	}
+	logger.Load(ctx).InfoContext(ctx, "Actions: re-run triggered for workflow run", slog.Int64("run", runID))
+	return nil
+}
+
 // ApproveWorkflowRun sends a raw API request to approve a pending workflow run.
 // (go-github v68 does not expose this specific endpoint).
 func (c *Client) ApproveWorkflowRun(ctx context.Context, runID int64) error {
+	baseURL := "https://api.github.com/"
+	if c.gh.BaseURL != nil {
+		baseURL = c.gh.BaseURL.String()
+	}
 	endpoint := fmt.Sprintf(
-		"https://api.github.com/repos/%s/%s/actions/runs/%d/approve",
-		url.PathEscape(c.owner), url.PathEscape(c.repo), runID,
+		"%srepos/%s/%s/actions/runs/%d/approve",
+		baseURL, url.PathEscape(c.owner), url.PathEscape(c.repo), runID,
 	)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, nil)
 	if err != nil {
@@ -756,13 +975,26 @@ func (c *Client) ApproveWorkflowRun(ctx context.Context, runID int64) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNoContent {
-		log.Printf("Actions: successfully approved run %d", runID)
+		logger.Load(ctx).InfoContext(ctx, "Actions: successfully approved run", slog.Int64("run", runID))
 		return nil
 	}
+
+	body, _ := io.ReadAll(resp.Body)
+	logger.Load(ctx).WarnContext(ctx, "Actions: approve run failed",
+		slog.Int64("run", runID),
+		slog.Int("status", resp.StatusCode),
+		slog.String("body", string(body)),
+	)
 	return fmt.Errorf(
 		"approve run %d: unexpected status %d %s",
 		runID, resp.StatusCode, http.StatusText(resp.StatusCode),
 	)
+}
+
+// CountCIFixPromptsSent returns the number of CI-fix-only prompts posted on
+// the given PR by counting comments containing CIFixCommentMarker.
+func (c *Client) CountCIFixPromptsSent(ctx context.Context, prNum int) (int, error) {
+	return c.countCommentsWithMarker(ctx, prNum, CIFixCommentMarker)
 }
 
 // CountAgentContinueComments returns the number of "@copilot continue"
@@ -1030,10 +1262,18 @@ type CopilotAgentJobRequest struct {
 	IssueURL         string `json:"issue_url,omitempty"`
 }
 
-// Copilot agent task (e.g., "in_progress", "running", "queued", "completed", "failed").
+// CopilotJobStatus contains the status of a scheduled Copilot agent task (e.g., "in_progress", "running", "queued", "completed", "failed").
 type CopilotJobStatus struct {
 	JobID  string `json:"job_id"`
 	Status string `json:"status"` // "running", "completed", etc.
+
+	PullRequest *struct {
+		Number int `json:"number"`
+	} `json:"pull_request,omitempty"`
+
+	WorkflowRun *struct {
+		ID int64 `json:"id"`
+	} `json:"workflow_run,omitempty"`
 }
 
 // GetCopilotJobStatus queries the Copilot API for the status of a specific job ID.
@@ -1054,11 +1294,11 @@ func (c *Client) GetJobStatusAt(ctx context.Context, endpoint, jobID string) (*C
 	if err != nil {
 		return nil, fmt.Errorf("build copilot job status request: %w", err)
 	}
-	req.Header.Set("Authorization", "Bearer "+c.token)
 	req.Header.Set("Copilot-Integration-Id", "copilot-autocode")
 	req.Header.Set("X-Github-Api-Version", copilotAPIVersion)
+	req.Header.Set("Authorization", "Bearer "+c.token)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := c.httpClient().Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("invoke copilot job status: %w", err)
 	}
@@ -1174,7 +1414,7 @@ func (c *Client) InvokeAgentAt(
 	req.Header.Set("Copilot-Integration-Id", "copilot-autocode")
 	req.Header.Set("X-Github-Api-Version", copilotAPIVersion)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := c.httpClient().Do(req)
 	if err != nil {
 		return "", fmt.Errorf("invoke copilot agent: %w", err)
 	}
@@ -1190,14 +1430,16 @@ func (c *Client) InvokeAgentAt(
 	// Best-effort parse of the job ID from the response.
 	var parsed copilotAgentJobResponse
 	if err := json.Unmarshal(respBody, &parsed); err != nil {
-		log.Printf("copilot agent: could not parse response body: %v (raw: %s)", err, string(respBody))
+		logger.Load(ctx).WarnContext(ctx, "copilot agent: could not parse response body",
+			slog.Any("err", err), slog.String("raw", string(respBody)))
 		return "", nil
 	}
 	jobID := parsed.ID
 	if jobID == "" {
 		jobID = parsed.JobID
 	}
-	log.Printf("copilot agent: invoked successfully (job_id=%q, raw response: %s)", jobID, string(respBody))
+	logger.Load(ctx).InfoContext(ctx, "copilot agent: invoked successfully",
+		slog.String("job_id", jobID), slog.String("raw", string(respBody)))
 	return jobID, nil
 }
 

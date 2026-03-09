@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/atotto/clipboard"
 	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -25,8 +26,9 @@ type LogEvent struct {
 const (
 	tuiNumCols       = 3  // number of kanban columns
 	tuiSpinnerFPS    = 10 // spinner frames per second
-	tuiChromeRows    = 8  // rows reserved for title, status bar, borders, and margins
+	tuiChromeRows    = 9  // rows reserved for title, status bar, borders, margins, and copy button
 	tuiLogBoxHeight  = 5  // fixed rows for logs
+	logHistorySize   = 50 // simple ring buffer of recent logs
 	tuiColMinHeight  = 5  // minimum column height in rows
 	tuiColSidePad    = 8  // total horizontal padding (borders + gutters)
 	tuiColMinWidth   = 20 // minimum column width in characters
@@ -36,6 +38,19 @@ const (
 	tuiSubLineMinW   = 5  // minimum useful sub-line content width
 	tuiSecsPerMin    = 60 // seconds per minute for % modulo in formatCountdown
 	tuiStatusMaxLen  = 80 // max characters shown for error/warning messages
+
+	tuiDoublePadding = 2 // multiplier for symmetric horizontal padding
+	tuiColorSuccess  = "10"
+	tuiColorFailure  = "9"
+	tuiColorSpinner  = "#00ff87"
+
+	tuiCopyFeedbackDuration = time.Second * 2
+
+	// Layout padding and border constants.
+	tuiBorderRows       = 2  // rows for top/bottom borders
+	tuiLogBoxPadding    = 2  // horizontal padding for log box
+	tuiCopyWidgetMargin = 4  // horizontal margin for copy button
+	tuiMinInnerWidth    = 10 // minimum width for truncated content
 )
 
 // secondTickMsg is fired every second so live countdown timers in item
@@ -47,6 +62,9 @@ func secondTick() tea.Cmd {
 		return secondTickMsg(t)
 	})
 }
+
+// clearCopyMsg is fired after logs are copied to reset the "[Copied!]" widget.
+type clearCopyMsg struct{}
 
 // Model is the root Bubble Tea model for the dashboard.
 type Model struct {
@@ -61,8 +79,10 @@ type Model struct {
 	lastErr  error
 	lastWarn string // most recent non-fatal warning (e.g. Copilot assignment failure)
 
-	logs    []string // simple ring buffer of recent logs
+	logs    []string // simple ring buffer of recent logs: size logHistorySize
 	logHead int      // index for next log insertion
+
+	logsCopied bool // true if logs were recently copied to clipboard
 
 	owner    string
 	repo     string
@@ -76,10 +96,10 @@ func New(owner, repo string, interval int) Model {
 		Frames: []string{"-", "\\", "|", "/"},
 		FPS:    time.Second / tuiSpinnerFPS,
 	}
-	sp.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("#00ff87"))
+	sp.Style = lipgloss.NewStyle().Foreground(lipgloss.Color(tuiColorSpinner))
 	return Model{
 		spinner:  sp,
-		logs:     make([]string, 50), // keep last 50 logs
+		logs:     make([]string, logHistorySize), // keep last N logs
 		owner:    owner,
 		repo:     repo,
 		interval: interval,
@@ -98,6 +118,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.String() == "ctrl+c" || msg.String() == "q" {
 			return m, tea.Quit
 		}
+		if msg.String() == "c" {
+			var sb strings.Builder
+			size := len(m.logs)
+			for i := range size {
+				idx := (m.logHead + i) % size
+				if m.logs[idx] != "" {
+					sb.WriteString(m.logs[idx])
+					sb.WriteString("\n")
+				}
+			}
+			_ = clipboard.WriteAll(sb.String())
+			m.logsCopied = true
+			return m, tea.Tick(tuiCopyFeedbackDuration, func(_ time.Time) tea.Msg { return clearCopyMsg{} })
+		}
+
+	case clearCopyMsg:
+		m.logsCopied = false
+		return m, nil
 
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
@@ -138,11 +176,8 @@ func (m Model) View() string {
 		return "Initializing..."
 	}
 
-	// Reserve space for title (1 line), title margin (1 line), borders (2 lines),
-	// margins between blocks (3 lines), log box (tuiLogBoxHeight + 2 for borders),
-	// and status bar (1 line).
-	// That's roughly tuiChromeRows + (tuiLogBoxHeight + 2) total reserved lines.
-	reservedRows := tuiChromeRows + tuiLogBoxHeight + 2
+	// Roughly tuiChromeRows + (tuiLogBoxHeight + tuiBorderRows) total reserved lines.
+	reservedRows := tuiChromeRows + tuiLogBoxHeight + tuiBorderRows
 	colHeight := max(m.height-reservedRows, tuiColMinHeight)
 
 	// Ensure colWidth takes internal padding/borders into account
@@ -162,9 +197,15 @@ func (m Model) View() string {
 	columns := lipgloss.JoinHorizontal(lipgloss.Top,
 		queueCol, "  ", codingCol, "  ", reviewCol)
 
-	logBoxWidth := m.width - 2 // -2 for left/right border padding
+	logBoxWidth := m.width - tuiLogBoxPadding // horizontal border padding
 	logContent := m.renderLogs(tuiLogBoxHeight)
 	logBox := logBoxStyle.Width(logBoxWidth).Height(tuiLogBoxHeight).Render(logContent)
+
+	copyText := dimItemStyle.Render("[c] copy logs")
+	if m.logsCopied {
+		copyText = lipgloss.NewStyle().Foreground(lipgloss.Color(tuiColorSuccess)).Render("[Copied!]")
+	}
+	copyWidget := lipgloss.NewStyle().Width(m.width - tuiCopyWidgetMargin).Align(lipgloss.Right).Render(copyText)
 
 	statusLine := m.renderStatus()
 
@@ -173,6 +214,7 @@ func (m Model) View() string {
 		"",
 		columns,
 		"",
+		copyWidget,
 		logBox,
 		"",
 		statusLine,
@@ -182,15 +224,13 @@ func (m Model) View() string {
 func (m Model) renderLogs(height int) string {
 	// Calculate an effective inner width to truncate logs
 	// Box padding is left/right 1 + border left/right 1 = 4 total subtracted
-	innerW := m.width - 4
-	if innerW < 10 {
-		innerW = 10
-	}
+	innerW := m.width - (tuiLogBoxPadding * tuiDoublePadding) // padding + borders
+	innerW = max(innerW, tuiMinInnerWidth)
 
 	// Read out logs from the ring buffer in chronological order
 	var ordered []string
 	size := len(m.logs)
-	for i := 0; i < size; i++ {
+	for i := range size {
 		idx := (m.logHead + i) % size
 		if m.logs[idx] != "" {
 			// truncate log to prevent terminal wrapping from ruining box
@@ -299,10 +339,11 @@ func (m Model) RenderItem(s *poller.State, colWidth int) (string, int) {
 	issueHTML := issue.GetHTMLURL()
 	renderedTitle := itemStyle.Render(title)
 
-	// Make Issue Number and Title clickable links (OSC-8).
+	// Make Issue Number and Title clickable links (OSC-8) and visually underline them.
 	if issueHTML != "" {
-		numStr = issueNumStyle.Render(numStr)
+		numStr = issueNumStyle.Underline(true).Render(numStr)
 		numStr = fmt.Sprintf("\x1b]8;;%s\x1b\\%s\x1b]8;;\x1b\\", issueHTML, numStr)
+		renderedTitle = itemStyle.Underline(true).Render(title)
 		renderedTitle = fmt.Sprintf("\x1b]8;;%s\x1b\\%s\x1b]8;;\x1b\\", issueHTML, renderedTitle)
 	} else {
 		numStr = issueNumStyle.Render(numStr)
@@ -312,6 +353,7 @@ func (m Model) RenderItem(s *poller.State, colWidth int) (string, int) {
 		prNum := fmt.Sprintf("PR#%d", s.PR.GetNumber())
 		renderedPR := prNumStyle.Render(prNum)
 		if prHTML := s.PR.GetHTMLURL(); prHTML != "" {
+			renderedPR = prNumStyle.Underline(true).Render(prNum)
 			renderedPR = fmt.Sprintf("\x1b]8;;%s\x1b\\%s\x1b]8;;\x1b\\", prHTML, renderedPR)
 		}
 		prStr = " -> " + renderedPR
@@ -350,9 +392,9 @@ func (m Model) RenderStatusSubLine(s *poller.State, colWidth int) string {
 	case "pending":
 		agentIcon = " " + m.spinner.View()
 	case "success":
-		agentIcon = " " + lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Render("[OK]")
+		agentIcon = " " + lipgloss.NewStyle().Foreground(lipgloss.Color(tuiColorSuccess)).Render("[OK]")
 	case "failed":
-		agentIcon = " " + lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Render("[X]")
+		agentIcon = " " + lipgloss.NewStyle().Foreground(lipgloss.Color(tuiColorFailure)).Render("[X]")
 	}
 
 	parts := []string{}

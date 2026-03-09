@@ -12,7 +12,9 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
@@ -21,47 +23,65 @@ import (
 
 	"github.com/BlackbirdWorks/copilot-autocode/config"
 	"github.com/BlackbirdWorks/copilot-autocode/ghclient"
+	"github.com/BlackbirdWorks/copilot-autocode/pkgs/logger"
+	"github.com/BlackbirdWorks/copilot-autocode/pkgs/rotatinglog"
 	"github.com/BlackbirdWorks/copilot-autocode/poller"
 	"github.com/BlackbirdWorks/copilot-autocode/tui"
 )
 
-// logWriter intercepts log.Printf output and forwards it to Bubble Tea as a LogMsg.
+const (
+	logBufferSize = 100 // size of the channel between logWriter and TUI
+)
+
+// logWriter intercepts [log.Printf] output and forwards it to Bubble Tea as a LogEvent.
 type logWriter struct {
-	prog *tea.Program
+	prog  *tea.Program
+	msgCh chan string
 }
 
-func (w *logWriter) Write(p []byte) (n int, err error) {
-	if w.prog != nil {
-		// Strip the trailing newline that log.Printf automatically adds
-		text := string(p)
-		if len(text) > 0 && text[len(text)-1] == '\n' {
-			text = text[:len(text)-1]
+func (w *logWriter) start() {
+	go func() {
+		for msg := range w.msgCh {
+			if w.prog != nil {
+				w.prog.Send(tui.LogEvent{Message: msg})
+			}
 		}
-		w.prog.Send(tui.LogEvent{Message: text})
+	}()
+}
+
+func (w *logWriter) Write(p []byte) (int, error) {
+	// slog.TextHandler adds a trailing newline; strip it for the TUI LogEvent.
+	text := string(p)
+	if len(text) > 0 && text[len(text)-1] == '\n' {
+		text = text[:len(text)-1]
+	}
+	select {
+	case w.msgCh <- text:
+	default:
+		// Drop if buffer full to avoid blocking main thread.
 	}
 	return len(p), nil
 }
 
 func main() {
+	bootstrapLogger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+
 	cfgPath := flag.String("config", "config.yaml", "path to config.yaml")
 	flag.Parse()
 
 	token := os.Getenv("GITHUB_TOKEN")
 	if token == "" {
-		log.Fatal("GITHUB_TOKEN environment variable is required")
+		bootstrapLogger.Error("GITHUB_TOKEN environment variable is required")
+		os.Exit(1)
 	}
 
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {
-		log.Fatalf("load config: %v", err)
+		bootstrapLogger.Error("failed to load config", slog.Any("err", err))
+		os.Exit(1)
 	}
 
 	gh := ghclient.New(token, cfg)
-	ctx, cancel := context.WithCancel(context.Background())
-
-	// Create and start the background poller.
-	p := poller.New(cfg, gh, token)
-	p.Start(ctx)
 
 	// Create the Bubble Tea model.
 	model := tui.New(cfg.GitHubOwner, cfg.GitHubRepo, cfg.PollIntervalSeconds)
@@ -72,8 +92,36 @@ func main() {
 		tea.WithMouseCellMotion(),
 	)
 
-	// Intercept standard library logger and forward to the TUI.
-	log.SetOutput(&logWriter{prog: prog})
+	// Configure slog to forward to both the TUI and a local log file.
+	lw := &logWriter{
+		prog:  prog,
+		msgCh: make(chan string, logBufferSize),
+	}
+	lw.start()
+
+	var logDest io.Writer = lw
+	rl, err := rotatinglog.New("copilot-autocode.log", cfg.LogMaxSizeMB, cfg.LogMaxFiles)
+	if err != nil {
+		bootstrapLogger.Warn("could not open log file; logging to TUI only", slog.Any("err", err))
+	} else {
+		defer rl.Close()
+		logDest = io.MultiWriter(lw, rl)
+	}
+
+	handler := slog.NewTextHandler(logDest, &slog.HandlerOptions{Level: slog.LevelInfo})
+	slog.SetDefault(slog.New(handler))
+
+	// Redirect standard log.Printf calls (e.g. from dependencies) to slog.
+	log.SetOutput(slog.NewLogLogger(handler, slog.LevelInfo).Writer())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	ctx = logger.Save(ctx, slog.Default())
+
+	logger.Load(ctx).InfoContext(ctx, "Copilot Orchestrator starting...")
+
+	// Create and start the background poller.
+	p := poller.New(cfg, gh, token)
+	p.Start(ctx)
 
 	// Bridge poller events → Bubble Tea messages in a goroutine.
 	go func() {

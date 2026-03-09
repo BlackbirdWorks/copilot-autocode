@@ -1,0 +1,317 @@
+name: Pull Request CI
+
+on:
+  pull_request:
+    branches: [ main ]
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  checks: write
+  pull-requests: write
+  security-events: write
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: true
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v9
+
+  govulncheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: govulncheck
+        uses: golang/govulncheck-action@v1
+        with:
+          go-version-file: go.mod
+          go-package: ./...
+
+  codeql:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [ 'go' ]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: 'autobuild'
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"
+
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: true
+
+      - name: Run Unit Tests
+        run: |
+          COVERPKGS=$(go list ./... | grep -v -E '(test/|/demo$|/modules/|/teststack$)' | tr '\n' ',' | sed 's/,$//')
+          go tool gotestsum --format pkgname -- \
+            -race -shuffle on -short -timeout 5m \
+            -coverpkg="$COVERPKGS" -coverprofile=unit-coverage.out -covermode=atomic \
+            ./...
+
+      - name: Upload Coverage
+        uses: actions/upload-artifact@v7
+        with:
+          name: unit-coverage
+          path: unit-coverage.out
+          retention-days: 1
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: true
+
+      - name: Build static binary
+        run: |
+          CGO_ENABLED=0 GOOS=linux go build -tags 'netgo osusergo static_build' -trimpath \
+            -ldflags="-w -s" -o bin/copilot-autocode .
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: copilot-autocode-binary
+          path: bin/copilot-autocode
+          retention-days: 1
+
+  coverage:
+    runs-on: ubuntu-latest
+    needs: [unit]
+    permissions:
+      contents: write
+      checks: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: true
+
+      - name: Download All Coverage Artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: '*-coverage'
+          merge-multiple: true
+
+      - name: Merge Coverage Profiles
+        run: |
+          # Merge all coverage files into one
+          echo "mode: atomic" > coverage.out
+          for f in *-coverage.out; do
+            if [ -f "$f" ]; then
+              echo "Merging $f"
+              tail -n +2 "$f" >> coverage.out
+            fi
+          done
+          go tool cover -func=coverage.out | tail -1
+
+      - name: Check Coverage Thresholds
+        id: coverage
+        uses: vladopajic/go-test-coverage@v2
+        with:
+          profile: coverage.out
+          config: .testcoverage.yml
+
+      - name: Generate Smart Coverage Report
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@v8
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const { execSync } = require('child_process');
+
+            let totalCoverage = '0.0%';
+            let newCodeCoverage = 'N/A';
+            let newCodeStats = { covered: 0, total: 0 };
+            let fileBreakdown = [];
+
+            try {
+              // 1. Total Coverage
+              const totalOutput = execSync('go tool cover -func=coverage.out | grep total | awk \'{print $3}\'').toString().trim();
+              totalCoverage = totalOutput;
+
+              // 2. New Code Coverage (Diff-based)
+              const baseRef = context.payload.pull_request.base.ref;
+              console.log(`Comparing against base ref: ${baseRef}`);
+
+              // Ensure base ref is fetched
+              execSync(`git fetch origin ${baseRef} --depth=1`);
+
+              const diff = execSync(`git diff origin/${baseRef}...HEAD -U0`).toString();
+              const changedLines = {}; // file -> Set of line numbers
+
+              const diffLines = diff.split('\n');
+              let currentFile = null;
+              for (const line of diffLines) {
+                if (line.startsWith('+++ b/')) {
+                  currentFile = line.substring(6);
+                  changedLines[currentFile] = new Set();
+                } else if (line.startsWith('@@ ') && currentFile) {
+                  const match = line.match(/@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/);
+                  if (match) {
+                    const start = parseInt(match[1]);
+                    const count = parseInt(match[2] || '1');
+                    for (let i = 0; i < count; i++) {
+                      changedLines[currentFile].add(start + i);
+                    }
+                  }
+                }
+              }
+
+              // 3. Parse coverage.out and calculate stats
+              const coverageData = fs.readFileSync('coverage.out', 'utf8').split('\n');
+              const fileStats = {}; // file -> {covered: 0, total: 0}
+
+              for (const line of coverageData) {
+                if (!line || line.startsWith('mode:')) continue;
+
+                const [loc, numStmt, hits] = line.split(' ');
+                const [fullPath, range] = loc.split(':');
+                const [start, end] = range.split(',');
+                const startLine = parseInt(start.split('.')[0]);
+                const endLine = parseInt(end.split('.')[0]);
+                const stmts = parseInt(numStmt);
+                const hitCount = parseInt(hits);
+
+                // Find relative path
+                const relativePath = fullPath.replace(/^github\.com\/[^\/]+\/[^\/]+\//, '');
+
+                if (changedLines[relativePath]) {
+                  if (!fileStats[relativePath]) fileStats[relativePath] = { covered: 0, total: 0 };
+
+                  const fileLines = changedLines[relativePath];
+                  let blockImpacted = false;
+                  for (let l = startLine; l <= endLine; l++) {
+                    if (fileLines.has(l)) {
+                      blockImpacted = true;
+                      break;
+                    }
+                  }
+
+                  if (blockImpacted) {
+                    newCodeStats.total += stmts;
+                    fileStats[relativePath].total += stmts;
+                    if (hitCount > 0) {
+                      newCodeStats.covered += stmts;
+                      fileStats[relativePath].covered += stmts;
+                    }
+                  }
+                }
+              }
+
+              if (newCodeStats.total > 0) {
+                newCodeCoverage = ((newCodeStats.covered / newCodeStats.total) * 100).toFixed(1) + '%';
+              }
+
+              fileBreakdown = Object.entries(fileStats)
+                .map(([file, stats]) => ({
+                  file,
+                  coverage: stats.total > 0 ? ((stats.covered / stats.total) * 100).toFixed(1) + '%' : '0.0%',
+                  lines: `${stats.covered}/${stats.total}`
+                }))
+                .sort((a, b) => a.file.localeCompare(b.file));
+
+            } catch (e) {
+              console.log('Failed to calculate coverage metrics:', e);
+            }
+
+            const header = '## 📊 Code Coverage Report';
+            const totalStatus = parseFloat(totalCoverage) >= 85 ? '✅' : '❌';
+            const newStatus = parseFloat(newCodeCoverage) >= 85 || newCodeCoverage === 'N/A' ? '✅' : '⚠️';
+
+            let fileTable = '';
+            if (fileBreakdown.length > 0) {
+              fileTable = '\n### 📄 Impacted Files Breakdown\n\n' +
+                '| File | New Code Coverage | Lines |\n' +
+                '| :--- | :--- | :--- |\n' +
+                fileBreakdown.map(f => `| \`${f.file}\` | ${f.coverage} | ${f.lines} |`).join('\n');
+            }
+
+            const body = `${header}
+
+            | Metric | Value | Status |
+            | :--- | :--- | :--- |
+            | **Total Coverage** | ${totalCoverage} | ${totalStatus} |
+            | **New Code Coverage** | ${newCodeCoverage} (${newCodeStats.covered}/${newCodeStats.total} stmts) | ${newStatus} |
+            ${fileTable}
+
+            > [!TIP]
+            > This project maintains a minimum coverage threshold of **85%**. Maintain or improve coverage on new code to ensure long-term stability.
+
+            ---
+            *Last updated: ${new Date().toUTCString()}*`;
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const botComment = comments.find(c => c.body.startsWith(header));
+
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: body
+              });
+            }

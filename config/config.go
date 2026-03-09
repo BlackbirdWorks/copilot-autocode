@@ -19,6 +19,9 @@ const (
 	defaultCopilotInvokeMaxRetries    = 3
 	defaultAgentTimeoutRetryDelaySecs = 1800
 	defaultMaxAgentContinueRetries    = 3
+	defaultMaxCIFixRounds             = 6
+	defaultLogMaxSizeMB               = 5
+	defaultLogMaxFiles                = 3
 
 	minPollIntervalSecs         = 10
 	minCopilotInvokeTimeoutSecs = 30
@@ -124,9 +127,23 @@ type Config struct {
 	// CI-fix flow.  Default: 3.
 	MaxAgentContinueRetries int `yaml:"max_agent_continue_retries"`
 
+	// MaxCIFixRounds is the number of CI-fix-only prompts posted after
+	// refinement rounds are exhausted but CI is still failing.  These prompts
+	// contain only the failing workflow/job details (no review requirements).
+	// Default: 6 (double the refinement rounds).
+	MaxCIFixRounds int `yaml:"max_ci_fix_rounds"`
+
 	// SkipCIChecks bypasses the CI wait loop when true, merging PRs after
 	// refinement even if tests fail or no workflows exist.  Default: false.
 	SkipCIChecks bool `yaml:"skip_ci_checks"`
+
+	// LogMaxSizeMB is the maximum size (in megabytes) of a single log file
+	// before it is rotated.  Default: 5.
+	LogMaxSizeMB int `yaml:"log_max_size_mb"`
+
+	// LogMaxFiles is the maximum number of rotated log files to keep.
+	// Older files are deleted when the limit is exceeded.  Default: 3.
+	LogMaxFiles int `yaml:"log_max_files"`
 }
 
 // Load reads a YAML config file from path and returns a populated Config with
@@ -169,6 +186,9 @@ func defaultConfig() *Config {
 		AgentTimeoutRetryDelaySeconds: defaultAgentTimeoutRetryDelaySecs,
 		AgentContinuePrompt:           "@copilot continue. Please commit and push often so you don't lose work.",
 		MaxAgentContinueRetries:       defaultMaxAgentContinueRetries,
+		MaxCIFixRounds:                defaultMaxCIFixRounds,
+		LogMaxSizeMB:                  defaultLogMaxSizeMB,
+		LogMaxFiles:                   defaultLogMaxFiles,
 	}
 }
 
@@ -208,6 +228,15 @@ func (c *Config) validate() error {
 	}
 	if c.MaxAgentContinueRetries < 1 {
 		c.MaxAgentContinueRetries = 1
+	}
+	if c.MaxCIFixRounds < 0 {
+		c.MaxCIFixRounds = 0
+	}
+	if c.LogMaxSizeMB < 1 {
+		c.LogMaxSizeMB = defaultLogMaxSizeMB
+	}
+	if c.LogMaxFiles < 1 {
+		c.LogMaxFiles = defaultLogMaxFiles
 	}
 	return nil
 }
