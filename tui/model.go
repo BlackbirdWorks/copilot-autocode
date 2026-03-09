@@ -25,7 +25,8 @@ type LogEvent struct {
 const (
 	tuiNumCols       = 3  // number of kanban columns
 	tuiSpinnerFPS    = 10 // spinner frames per second
-	tuiChromeRows    = 6  // rows reserved for title, status bar, and borders
+	tuiChromeRows    = 8  // rows reserved for title, status bar, borders, and margins
+	tuiLogBoxHeight  = 5  // fixed rows for logs
 	tuiColMinHeight  = 5  // minimum column height in rows
 	tuiColSidePad    = 8  // total horizontal padding (borders + gutters)
 	tuiColMinWidth   = 20 // minimum column width in characters
@@ -137,8 +138,14 @@ func (m Model) View() string {
 		return "Initializing..."
 	}
 
-	// Reserve space for title (3 lines) + status bar (1 line) + borders (2).
-	colHeight := max(m.height-tuiChromeRows, tuiColMinHeight)
+	// Reserve space for title (1 line), title margin (1 line), borders (2 lines),
+	// margins between blocks (3 lines), log box (tuiLogBoxHeight + 2 for borders),
+	// and status bar (1 line).
+	// That's roughly tuiChromeRows + (tuiLogBoxHeight + 2) total reserved lines.
+	reservedRows := tuiChromeRows + tuiLogBoxHeight + 2
+	colHeight := max(m.height-reservedRows, tuiColMinHeight)
+
+	// Ensure colWidth takes internal padding/borders into account
 	colWidth := max((m.width-tuiColSidePad)/tuiNumCols, tuiColMinWidth)
 
 	title := titleStyle.Width(m.width).Render(
@@ -155,10 +162,9 @@ func (m Model) View() string {
 	columns := lipgloss.JoinHorizontal(lipgloss.Top,
 		queueCol, "  ", codingCol, "  ", reviewCol)
 
-	logBoxHeight := 5 // fixed 5 rows for logs
-	logBoxWidth := m.width - 2
-	logContent := m.renderLogs(logBoxHeight)
-	logBox := logBoxStyle.Width(logBoxWidth).Height(logBoxHeight).Render(logContent)
+	logBoxWidth := m.width - 2 // -2 for left/right border padding
+	logContent := m.renderLogs(tuiLogBoxHeight)
+	logBox := logBoxStyle.Width(logBoxWidth).Height(tuiLogBoxHeight).Render(logContent)
 
 	statusLine := m.renderStatus()
 
@@ -174,13 +180,29 @@ func (m Model) View() string {
 }
 
 func (m Model) renderLogs(height int) string {
+	// Calculate an effective inner width to truncate logs
+	// Box padding is left/right 1 + border left/right 1 = 4 total subtracted
+	innerW := m.width - 4
+	if innerW < 10 {
+		innerW = 10
+	}
+
 	// Read out logs from the ring buffer in chronological order
 	var ordered []string
 	size := len(m.logs)
 	for i := 0; i < size; i++ {
 		idx := (m.logHead + i) % size
 		if m.logs[idx] != "" {
-			ordered = append(ordered, m.logs[idx])
+			// truncate log to prevent terminal wrapping from ruining box
+			line := m.logs[idx]
+			if lipgloss.Width(line) > innerW {
+				// use runes for safe truncation
+				runes := []rune(line)
+				if len(runes) > innerW {
+					line = string(runes[:innerW-1]) + "…"
+				}
+			}
+			ordered = append(ordered, line)
 		}
 	}
 
