@@ -73,7 +73,7 @@ type Model struct {
 func New(owner, repo string, interval int) Model {
 	sp := spinner.New()
 	sp.Spinner = spinner.Spinner{
-		Frames: []string{"|", "/", "-", "\\"},
+		Frames: []string{"-", "\\", "|", "/"},
 		FPS:    time.Second / tuiSpinnerFPS,
 	}
 	sp.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("#00ff87"))
@@ -366,12 +366,11 @@ func (m Model) RenderStatusSubLine(s *poller.State, colWidth int) string {
 		parts = append(parts, current)
 	}
 
-	// Combine all parts with copilot icon.
-	base := strings.Join(parts, " - ")
-	if agentIcon != "" {
-		text = fmt.Sprintf("%s - copilot %s", base, agentIcon)
-	} else {
-		text = base
+	text = strings.Join(parts, " - ")
+	if len(parts) > 0 && agentIcon != "" {
+		text += " - copilot"
+	} else if agentIcon != "" {
+		text = "copilot"
 	}
 
 	// Append next action if applicable.
@@ -379,9 +378,13 @@ func (m Model) RenderStatusSubLine(s *poller.State, colWidth int) string {
 		text += fmt.Sprintf("  ·  %s", next)
 	}
 
+	// Determine how much space we actually have for the text part.
+	// We must reserve space for the agent icon if it exists.
+	iconWidth := lipgloss.Width(agentIcon)
+
 	// Truncate to the column's effective content width minus the 2-space indent.
-	// effectiveWidth = colWidth - 2 (Padding(0,1)) - 2 (sub-line indent).
-	maxWidth := max(colWidth-tuiSubLinePad, tuiSubLineMinW)
+	// effectiveWidth = colWidth - 2 (Padding(0,1)) - 2 (sub-line indent) - iconWidth.
+	maxWidth := max(colWidth-tuiSubLinePad-iconWidth, tuiSubLineMinW)
 
 	// If too long, try shortening "refinement" to "ref"
 	if lipgloss.Width(text) > maxWidth {
@@ -397,7 +400,8 @@ func (m Model) RenderStatusSubLine(s *poller.State, colWidth int) string {
 		}
 	}
 
-	return statusLineStyle.Render("  " + text)
+	// Finally append the icon *after* truncation so its ANSI/Runes aren't corrupted
+	return statusLineStyle.Render("  "+text) + agentIcon
 }
 
 // FormatCountdown formats a duration as a short human-readable string,
