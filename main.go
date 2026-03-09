@@ -25,6 +25,23 @@ import (
 	"github.com/BlackbirdWorks/copilot-autocode/tui"
 )
 
+// logWriter intercepts log.Printf output and forwards it to Bubble Tea as a LogMsg.
+type logWriter struct {
+	prog *tea.Program
+}
+
+func (w *logWriter) Write(p []byte) (n int, err error) {
+	if w.prog != nil {
+		// Strip the trailing newline that log.Printf automatically adds
+		text := string(p)
+		if len(text) > 0 && text[len(text)-1] == '\n' {
+			text = text[:len(text)-1]
+		}
+		w.prog.Send(tui.LogEvent{Message: text})
+	}
+	return len(p), nil
+}
+
 func main() {
 	cfgPath := flag.String("config", "config.yaml", "path to config.yaml")
 	flag.Parse()
@@ -54,6 +71,9 @@ func main() {
 		tea.WithAltScreen(),
 		tea.WithMouseCellMotion(),
 	)
+
+	// Intercept standard library logger and forward to the TUI.
+	log.SetOutput(&logWriter{prog: prog})
 
 	// Bridge poller events → Bubble Tea messages in a goroutine.
 	go func() {

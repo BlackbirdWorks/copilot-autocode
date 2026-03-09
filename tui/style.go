@@ -62,4 +62,12 @@ var (
 			Background(lipgloss.Color("#d93f0b")).
 			Foreground(lipgloss.Color("#ffffff")).
 			Padding(0, 1)
+
+	// App Logging area styles.
+	logBoxStyle = lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("#444444")).
+			Padding(0, 1)
+
+	logLineStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#888888"))
 )

@@ -16,6 +16,11 @@ import (
 // PollEvent wraps a poller.Event for delivery into the Bubble Tea message bus.
 type PollEvent struct{ poller.Event }
 
+// LogEvent is emitted by main.go's logWriter to pass standard log messages to the UI.
+type LogEvent struct {
+	Message string
+}
+
 // Layout and animation constants for the dashboard.
 const (
 	tuiNumCols       = 3  // number of kanban columns
@@ -55,6 +60,9 @@ type Model struct {
 	lastErr  error
 	lastWarn string // most recent non-fatal warning (e.g. Copilot assignment failure)
 
+	logs    []string // simple ring buffer of recent logs
+	logHead int      // index for next log insertion
+
 	owner    string
 	repo     string
 	interval int
@@ -70,6 +78,7 @@ func New(owner, repo string, interval int) Model {
 	sp.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("#00ff87"))
 	return Model{
 		spinner:  sp,
+		logs:     make([]string, 50), // keep last 50 logs
 		owner:    owner,
 		repo:     repo,
 		interval: interval,
@@ -103,6 +112,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Keep only the most recent warning for display.
 			m.lastWarn = msg.Warnings[len(msg.Warnings)-1]
 		}
+
+	case LogEvent:
+		m.logs[m.logHead] = msg.Message
+		m.logHead = (m.logHead + 1) % len(m.logs)
+		return m, nil
 
 	case spinner.TickMsg:
 		var cmd tea.Cmd
@@ -141,14 +155,53 @@ func (m Model) View() string {
 	columns := lipgloss.JoinHorizontal(lipgloss.Top,
 		queueCol, "  ", codingCol, "  ", reviewCol)
 
+	logBoxHeight := 5 // fixed 5 rows for logs
+	logBoxWidth := m.width - 2
+	logContent := m.renderLogs(logBoxHeight)
+	logBox := logBoxStyle.Width(logBoxWidth).Height(logBoxHeight).Render(logContent)
+
 	statusLine := m.renderStatus()
 
 	return lipgloss.JoinVertical(lipgloss.Left,
 		title,
 		"",
 		columns,
+		"",
+		logBox,
+		"",
 		statusLine,
 	)
+}
+
+func (m Model) renderLogs(height int) string {
+	// Read out logs from the ring buffer in chronological order
+	var ordered []string
+	size := len(m.logs)
+	for i := 0; i < size; i++ {
+		idx := (m.logHead + i) % size
+		if m.logs[idx] != "" {
+			ordered = append(ordered, m.logs[idx])
+		}
+	}
+
+	// Keep only the last 'height' logs
+	if len(ordered) > height {
+		ordered = ordered[len(ordered)-height:]
+	}
+
+	var sb strings.Builder
+	for i, l := range ordered {
+		sb.WriteString(logLineStyle.Render(l))
+		if i < len(ordered)-1 {
+			sb.WriteString("\n")
+		}
+	}
+
+	// Pad with newlines if fewer logs than height
+	for i := len(ordered); i < height; i++ {
+		sb.WriteString("\n")
+	}
+	return sb.String()
 }
 
 func (m Model) renderColumn(
@@ -294,7 +347,7 @@ func (m Model) RenderStatusSubLine(s *poller.State, colWidth int) string {
 	// Combine all parts with copilot icon.
 	base := strings.Join(parts, " - ")
 	if agentIcon != "" {
-		text = fmt.Sprintf("%s - copilot%s", base, agentIcon)
+		text = fmt.Sprintf("%s - copilot %s", base, agentIcon)
 	} else {
 		text = base
 	}

@@ -479,9 +479,6 @@ func (p *Poller) nudgeSingleCodingIssue(
 			s := status.Status
 			if s == "in_progress" || s == "running" || s == "queued" || s == "requested" || s == "pending" {
 				isAgentActive = true
-				log.Printf("issue #%d: specific Copilot job %q is active (status: %s); skipping re-invocation", num, jobID, s)
-			} else {
-				log.Printf("issue #%d: specific Copilot job %q is complete (status: %s)", num, jobID, s)
 			}
 		} else {
 			log.Printf("warning: could not fetch status for job %q: %v", jobID, err)
