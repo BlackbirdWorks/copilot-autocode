@@ -1,4 +1,4 @@
-package tui
+package tui_test
 
 import (
 	"regexp"
@@ -7,8 +7,12 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/BlackbirdWorks/copilot-autocode/poller"
 	"github.com/google/go-github/v68/github"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/BlackbirdWorks/copilot-autocode/poller"
+	"github.com/BlackbirdWorks/copilot-autocode/tui"
 )
 
 // ansiRe matches ANSI CSI escape sequences so tests can compare plain text.
@@ -19,7 +23,7 @@ func stripAnsi(s string) string {
 }
 
 // issueAt returns a minimal *github.Issue with the given number, title, and
-// creation time — enough for renderItem to work without nil dereferences.
+// creation time — enough for RenderItem to work without nil dereferences.
 func issueAt(num int, title string, createdAt time.Time) *github.Issue {
 	ts := github.Timestamp{Time: createdAt}
 	return &github.Issue{
@@ -29,9 +33,10 @@ func issueAt(num int, title string, createdAt time.Time) *github.Issue {
 	}
 }
 
-// ─── formatCountdown ────────────────────────────────────────────────────────
+// ─── FormatCountdown ────────────────────────────────────────────────────────
 
 func TestFormatCountdown(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name string
 		d    time.Duration
@@ -51,18 +56,17 @@ func TestFormatCountdown(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := formatCountdown(tc.d)
-			if got != tc.want {
-				t.Errorf("formatCountdown(%v) = %q; want %q", tc.d, got, tc.want)
-			}
+			t.Parallel()
+			assert.Equal(t, tc.want, tui.FormatCountdown(tc.d))
 		})
 	}
 }
 
-// ─── renderStatusSubLine ────────────────────────────────────────────────────
+// ─── RenderStatusSubLine ────────────────────────────────────────────────────
 
 func TestRenderStatusSubLine(t *testing.T) {
-	m := Model{}
+	t.Parallel()
+	m := tui.Model{}
 	now := time.Now()
 
 	tests := []struct {
@@ -71,8 +75,8 @@ func TestRenderStatusSubLine(t *testing.T) {
 		next         string
 		nextActionAt time.Time
 		colWidth     int
-		wantContains []string // all must appear in the stripped output
-		wantAbsent   []string // none must appear
+		wantContains []string
+		wantAbsent   []string
 	}{
 		{
 			name:         "current only — no separator",
@@ -97,7 +101,7 @@ func TestRenderStatusSubLine(t *testing.T) {
 			wantContains: []string{
 				"Waiting on coding agent to start",
 				"Poke Copilot in",
-				"m", // at least minutes in the countdown
+				"m",
 			},
 		},
 		{
@@ -109,50 +113,45 @@ func TestRenderStatusSubLine(t *testing.T) {
 			wantContains: []string{"Poke Copilot now"},
 		},
 		{
-			name:     "long text truncated on narrow column",
-			current:  "Waiting on coding agent to start",
-			next:     "Poke Copilot",
-			colWidth: 20,
-			// maxWidth = 20 - 4 = 16; full text is ~50 chars → truncated
+			name:         "long text truncated on narrow column",
+			current:      "Waiting on coding agent to start",
+			next:         "Poke Copilot",
+			colWidth:     20,
 			wantContains: []string{"…"},
 		},
 		{
-			name:     "very narrow column produces single ellipsis",
-			current:  "CI failing",
-			next:     "fix",
-			colWidth: 5,
-			// maxWidth = 5 - 4 = 1; only "…" fits
+			name:         "very narrow column produces single ellipsis",
+			current:      "CI failing",
+			next:         "fix",
+			colWidth:     5,
 			wantContains: []string{"…"},
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			s := &poller.State{
 				CurrentStatus: tc.current,
 				NextAction:    tc.next,
 				NextActionAt:  tc.nextActionAt,
 			}
-			got := stripAnsi(m.renderStatusSubLine(s, tc.colWidth))
-
+			got := stripAnsi(m.RenderStatusSubLine(s, tc.colWidth))
 			for _, want := range tc.wantContains {
-				if !strings.Contains(got, want) {
-					t.Errorf("renderStatusSubLine() = %q; want it to contain %q", got, want)
-				}
+				assert.Contains(t, got, want)
 			}
 			for _, absent := range tc.wantAbsent {
-				if strings.Contains(got, absent) {
-					t.Errorf("renderStatusSubLine() = %q; want it NOT to contain %q", got, absent)
-				}
+				assert.NotContains(t, got, absent)
 			}
 		})
 	}
 }
 
-// ─── renderItem line count ───────────────────────────────────────────────────
+// ─── RenderItem line count ───────────────────────────────────────────────────
 
 func TestRenderItemLineCount(t *testing.T) {
-	m := Model{}
+	t.Parallel()
+	m := tui.Model{}
 	issue := issueAt(42, "Fix the thing", time.Now())
 
 	tests := []struct {
@@ -183,26 +182,21 @@ func TestRenderItemLineCount(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			rendered, lines := m.renderItem(tc.state, tc.colWidth)
-			if lines != tc.wantLines {
-				t.Errorf("renderItem() lines = %d; want %d", lines, tc.wantLines)
-			}
-			// Verify that the embedded newline count matches the reported line count.
-			actualNewlines := strings.Count(rendered, "\n")
-			if actualNewlines != tc.wantLines-1 {
-				t.Errorf("renderItem() newline count = %d; want %d (rendered: %q)",
-					actualNewlines, tc.wantLines-1, rendered)
-			}
+			t.Parallel()
+			rendered, lines := m.RenderItem(tc.state, tc.colWidth)
+			assert.Equal(t, tc.wantLines, lines)
+			assert.Equal(t, tc.wantLines-1, strings.Count(rendered, "\n"))
 		})
 	}
 }
 
-// ─── renderItem title truncation ─────────────────────────────────────────────
+// ─── RenderItem title truncation ─────────────────────────────────────────────
 
 func TestRenderItemTitleTruncation(t *testing.T) {
-	m := Model{}
+	t.Parallel()
+	m := tui.Model{}
 	num := 1
-	now := time.Now() // "just now" age → predictable fixed-part width
+	now := time.Now()
 
 	tests := []struct {
 		name         string
@@ -224,7 +218,7 @@ func TestRenderItemTitleTruncation(t *testing.T) {
 		},
 		{
 			name:         "title exactly at budget — no ellipsis",
-			title:        "Fix", // very short, always fits
+			title:        "Fix",
 			colWidth:     30,
 			wantEllipsis: false,
 		},
@@ -238,29 +232,23 @@ func TestRenderItemTitleTruncation(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			issue := issueAt(num, tc.title, now)
 			s := &poller.State{Issue: issue}
-			rendered, _ := m.renderItem(s, tc.colWidth)
+			rendered, _ := m.RenderItem(s, tc.colWidth)
 			plain := stripAnsi(rendered)
 
-			hasEllipsis := strings.Contains(plain, "…")
-			if hasEllipsis != tc.wantEllipsis {
-				t.Errorf("renderItem() ellipsis=%v; want %v (plain: %q)",
-					hasEllipsis, tc.wantEllipsis, plain)
-			}
-
-			// Output must always be valid UTF-8 regardless of title content.
-			if !utf8.ValidString(plain) {
-				t.Errorf("renderItem() produced invalid UTF-8: %q", plain)
-			}
+			assert.Equal(t, tc.wantEllipsis, strings.Contains(plain, "…"))
+			require.True(t, utf8.ValidString(plain), "output must be valid UTF-8")
 		})
 	}
 }
 
-// ─── renderItem title line content ───────────────────────────────────────────
+// ─── RenderItem title line content ───────────────────────────────────────────
 
 func TestRenderItemTitleContent(t *testing.T) {
-	m := Model{}
+	t.Parallel()
+	m := tui.Model{}
 	now := time.Now()
 
 	prNum := 99
@@ -294,13 +282,11 @@ func TestRenderItemTitleContent(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			rendered, _ := m.renderItem(tc.state, tc.colWidth)
-			// Title line is always the first line.
+			t.Parallel()
+			rendered, _ := m.RenderItem(tc.state, tc.colWidth)
 			titleLine := stripAnsi(strings.SplitN(rendered, "\n", 2)[0])
 			for _, want := range tc.wantContains {
-				if !strings.Contains(titleLine, want) {
-					t.Errorf("renderItem() title line = %q; want it to contain %q", titleLine, want)
-				}
+				assert.Contains(t, titleLine, want)
 			}
 		})
 	}

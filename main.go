@@ -17,11 +17,12 @@ import (
 	"os/signal"
 	"syscall"
 
+	tea "github.com/charmbracelet/bubbletea"
+
 	"github.com/BlackbirdWorks/copilot-autocode/config"
 	"github.com/BlackbirdWorks/copilot-autocode/ghclient"
 	"github.com/BlackbirdWorks/copilot-autocode/poller"
 	"github.com/BlackbirdWorks/copilot-autocode/tui"
-	tea "github.com/charmbracelet/bubbletea"
 )
 
 func main() {
@@ -39,21 +40,14 @@ func main() {
 	}
 
 	gh := ghclient.New(token, cfg)
-
-	// Ensure required labels exist in the target repository.
-	setupCtx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	if err := gh.EnsureLabelsExist(setupCtx); err != nil {
-		log.Printf("warning: could not ensure labels exist: %v", err)
-	}
+	ctx, cancel := context.WithCancel(context.Background())
 
 	// Create and start the background poller.
 	p := poller.New(cfg, gh, token)
-	p.Start(setupCtx)
+	p.Start(ctx)
 
 	// Create the Bubble Tea model.
-	model := tui.New(cfg.GitHubOwner, cfg.GitHubRepo)
+	model := tui.New(cfg.GitHubOwner, cfg.GitHubRepo, cfg.PollIntervalSeconds)
 
 	prog := tea.NewProgram(
 		model,
@@ -78,7 +72,9 @@ func main() {
 	}()
 
 	if _, err := prog.Run(); err != nil {
+		cancel()
 		fmt.Fprintf(os.Stderr, "error running TUI: %v\n", err)
 		os.Exit(1)
 	}
+	cancel()
 }

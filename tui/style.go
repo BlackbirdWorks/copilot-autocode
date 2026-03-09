@@ -3,6 +3,9 @@ package tui
 
 import "github.com/charmbracelet/lipgloss"
 
+// titleHPad is the horizontal padding applied to the dashboard title bar.
+const titleHPad = 2
+
 var (
 	// Column header colors.
 	headerQueue  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#0075ca")).Padding(0, 1)
@@ -43,11 +46,20 @@ var (
 			Bold(true).
 			Foreground(lipgloss.Color("#ffffff")).
 			Background(lipgloss.Color("#1a1a2e")).
-			Padding(0, 2).
+			Padding(0, titleHPad).
 			Align(lipgloss.Center)
 
 	// Badge styles (inline status chips).
-	badgeQueue  = lipgloss.NewStyle().Background(lipgloss.Color("#0075ca")).Foreground(lipgloss.Color("#ffffff")).Padding(0, 1)
-	badgeCoding = lipgloss.NewStyle().Background(lipgloss.Color("#e4b800")).Foreground(lipgloss.Color("#000000")).Padding(0, 1)
-	badgeReview = lipgloss.NewStyle().Background(lipgloss.Color("#d93f0b")).Foreground(lipgloss.Color("#ffffff")).Padding(0, 1)
+	badgeQueue = lipgloss.NewStyle().
+			Background(lipgloss.Color("#0075ca")).
+			Foreground(lipgloss.Color("#ffffff")).
+			Padding(0, 1)
+	badgeCoding = lipgloss.NewStyle().
+			Background(lipgloss.Color("#e4b800")).
+			Foreground(lipgloss.Color("#000000")).
+			Padding(0, 1)
+	badgeReview = lipgloss.NewStyle().
+			Background(lipgloss.Color("#d93f0b")).
+			Foreground(lipgloss.Color("#ffffff")).
+			Padding(0, 1)
 )

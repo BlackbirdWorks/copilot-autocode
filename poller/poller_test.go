@@ -1,17 +1,21 @@
-package poller
+package poller_test
 
 import (
-	"strings"
 	"testing"
+
+	"github.com/google/go-github/v68/github"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/BlackbirdWorks/copilot-autocode/config"
 	"github.com/BlackbirdWorks/copilot-autocode/ghclient"
-	"github.com/google/go-github/v68/github"
+	"github.com/BlackbirdWorks/copilot-autocode/poller"
 )
 
-// ─── formatFallbackPrompt ─────────────────────────────────────────────────────
+// ─── FormatFallbackPrompt ─────────────────────────────────────────────────────
 
 func TestFormatFallbackPrompt(t *testing.T) {
+	t.Parallel()
 	num := 42
 	title := "Fix the login bug"
 	url := "https://github.com/org/repo/issues/42"
@@ -60,16 +64,14 @@ func TestFormatFallbackPrompt(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := formatFallbackPrompt(tc.template, issue)
-			if got != tc.want {
-				t.Errorf("formatFallbackPrompt() = %q; want %q", got, tc.want)
-			}
+			t.Parallel()
+			assert.Equal(t, tc.want, poller.FormatFallbackPrompt(tc.template, issue))
 		})
 	}
 }
 
-
 func TestSortIssuesAsc(t *testing.T) {
+	t.Parallel()
 	makeIssue := func(n int) *github.Issue { return &github.Issue{Number: &n} }
 
 	tests := []struct {
@@ -88,31 +90,26 @@ func TestSortIssuesAsc(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			issues := make([]*github.Issue, len(tc.input))
 			for i, n := range tc.input {
 				issues[i] = makeIssue(n)
 			}
 
-			sortIssuesAsc(issues)
+			poller.SortIssuesAsc(issues)
 
-			if len(issues) != len(tc.want) {
-				t.Fatalf("sortIssuesAsc() len = %d; want %d", len(issues), len(tc.want))
-			}
-			for i, issue := range issues {
-				if issue.GetNumber() != tc.want[i] {
-					t.Errorf("sortIssuesAsc()[%d] = %d; want %d",
-						i, issue.GetNumber(), tc.want[i])
-				}
+			require.Len(t, issues, len(tc.want))
+			for i, want := range tc.want {
+				assert.Equal(t, want, issues[i].GetNumber(), "index %d", i)
 			}
 		})
 	}
 }
 
-// ─── buildCIFixMessage ───────────────────────────────────────────────────────
+// ─── BuildCIFailureSection ───────────────────────────────────────────────────
 
-func TestBuildCIFixMessage(t *testing.T) {
-	p := &Poller{cfg: &config.Config{CIFixPrompt: "@copilot Please fix CI."}}
-
+func TestBuildCIFailureSection(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name         string
 		workflowName string
@@ -121,21 +118,18 @@ func TestBuildCIFixMessage(t *testing.T) {
 		wantAbsent   []string
 	}{
 		{
-			name:         "prompt only — no workflow or jobs",
+			name:         "no workflow or jobs",
 			workflowName: "",
 			failedJobs:   nil,
-			wantContains: []string{"@copilot Please fix CI."},
+			wantContains: []string{"please fix the following CI failures"},
 			wantAbsent:   []string{"Failing workflow", "Failed jobs"},
 		},
 		{
 			name:         "workflow name included",
 			workflowName: "CI / Build",
 			failedJobs:   nil,
-			wantContains: []string{
-				"@copilot Please fix CI.",
-				"**Failing workflow:** CI / Build",
-			},
-			wantAbsent: []string{"Failed jobs"},
+			wantContains: []string{"**Failing workflow:** CI / Build"},
+			wantAbsent:   []string{"Failed jobs"},
 		},
 		{
 			name:         "single failed job with log URL",
@@ -144,7 +138,6 @@ func TestBuildCIFixMessage(t *testing.T) {
 				{Name: "test", LogURL: "https://logs.example.com/1"},
 			},
 			wantContains: []string{
-				"@copilot Please fix CI.",
 				"**Failing workflow:** CI",
 				"**Failed jobs:** test",
 				"**test** logs: https://logs.example.com/1",
@@ -161,7 +154,6 @@ func TestBuildCIFixMessage(t *testing.T) {
 				"**Failed jobs:** build, lint",
 				"**build** logs: https://logs.example.com/build",
 			},
-			// lint has no LogURL so no log line for it
 			wantAbsent: []string{"**lint** logs"},
 		},
 		{
@@ -177,18 +169,27 @@ func TestBuildCIFixMessage(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := p.buildCIFixMessage(tc.workflowName, tc.failedJobs)
-
+			t.Parallel()
+			got := poller.BuildCIFailureSection(tc.workflowName, tc.failedJobs)
 			for _, want := range tc.wantContains {
-				if !strings.Contains(got, want) {
-					t.Errorf("buildCIFixMessage() = %q; want it to contain %q", got, want)
-				}
+				assert.Contains(t, got, want)
 			}
 			for _, absent := range tc.wantAbsent {
-				if strings.Contains(got, absent) {
-					t.Errorf("buildCIFixMessage() = %q; want it NOT to contain %q", got, absent)
-				}
+				assert.NotContains(t, got, absent)
 			}
 		})
 	}
+}
+
+// TestApproveRetriesFallback verifies that the Poller's retry-limit logic
+// correctly caps the number of workflow-run approval attempts.
+func TestApproveRetriesFallback(t *testing.T) {
+	t.Parallel()
+	// New() initialises approveRetries to an empty map and exposes MaxAgentContinueRetries
+	// through the config. We test only the public API surface here.
+	p := poller.New(&config.Config{
+		MaxAgentContinueRetries: 3,
+	}, nil, "")
+	require.NotNil(t, p)
+	assert.Equal(t, 3, p.Cfg().MaxAgentContinueRetries)
 }

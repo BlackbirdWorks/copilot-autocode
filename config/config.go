@@ -2,166 +2,212 @@
 package config
 
 import (
-"fmt"
-"os"
+	"errors"
+	"fmt"
+	"os"
 
-"gopkg.in/yaml.v3"
+	"gopkg.in/yaml.v3"
+)
+
+// Default values and validation bounds for built-in configuration.
+const (
+	defaultMaxConcurrentIssues        = 3
+	defaultPollIntervalSeconds        = 45
+	defaultMaxRefinementRounds        = 3
+	defaultMaxMergeConflictRetries    = 3
+	defaultCopilotInvokeTimeoutSecs   = 600
+	defaultCopilotInvokeMaxRetries    = 3
+	defaultAgentTimeoutRetryDelaySecs = 1800
+	defaultMaxAgentContinueRetries    = 3
+
+	minPollIntervalSecs         = 10
+	minCopilotInvokeTimeoutSecs = 30
+	minAgentRetryDelaySecs      = 60
 )
 
 // Config holds the application configuration.
 // All fields have built-in defaults; only github_owner and github_repo are required.
 type Config struct {
-// Required: the target repository.
-GitHubOwner string `yaml:"github_owner"`
-GitHubRepo  string `yaml:"github_repo"`
+	// Required: the target repository.
+	GitHubOwner string `yaml:"github_owner"`
+	GitHubRepo  string `yaml:"github_repo"`
 
-// Labels applied to issues to track their state through the workflow.
-// Defaults: ai-queue, ai-coding, ai-review.
-LabelQueue  string `yaml:"label_queue"`
-LabelCoding string `yaml:"label_coding"`
-LabelReview string `yaml:"label_review"`
+	// Labels applied to issues to track their state through the workflow.
+	// Defaults: ai-queue, ai-coding, ai-review, manual-takeover.
+	LabelQueue    string `yaml:"label_queue"`
+	LabelCoding   string `yaml:"label_coding"`
+	LabelReview   string `yaml:"label_review"`
+	LabelTakeover string `yaml:"label_takeover"`
 
-// CopilotUser is the GitHub username of the Copilot coding agent that is
-// assigned to issues when they enter the coding state.
-// Default: "copilot".
-CopilotUser string `yaml:"copilot_user"`
+	// MaxConcurrentIssues is the maximum number of issues that may be in the
+	// ai-coding state simultaneously.  Default: 3.
+	MaxConcurrentIssues int `yaml:"max_concurrent_issues"`
 
-// MaxConcurrentIssues is the maximum number of issues that may be in the
-// ai-coding state simultaneously.  Default: 3.
-MaxConcurrentIssues int `yaml:"max_concurrent_issues"`
+	// PollIntervalSeconds controls how often the orchestrator polls GitHub.
+	// Minimum: 10.  Default: 45.
+	PollIntervalSeconds int `yaml:"poll_interval_seconds"`
 
-// PollIntervalSeconds controls how often the orchestrator polls GitHub.
-// Minimum: 10.  Default: 45.
-PollIntervalSeconds int `yaml:"poll_interval_seconds"`
+	// MaxRefinementRounds is the number of times @copilot is asked to review
+	// its implementation against the original issue requirements after CI
+	// passes.  The PR is approved and merged only after all rounds are done.
+	// Default: 3.
+	MaxRefinementRounds int `yaml:"max_refinement_rounds"`
 
-// MaxRefinementRounds is the number of times @copilot is asked to review
-// its implementation against the original issue requirements after CI
-// passes.  The PR is approved and merged only after all rounds are done.
-// Default: 3.
-MaxRefinementRounds int `yaml:"max_refinement_rounds"`
+	// RefinementPrompt is the instructional body sent to @copilot for each
+	// refinement round.  The orchestrator prefixes it with the round counter
+	// and appends the machine-readable marker automatically.
+	// Default: a sensible built-in prompt.
+	RefinementPrompt string `yaml:"refinement_prompt"`
 
-// RefinementPrompt is the instructional body sent to @copilot for each
-// refinement round.  The orchestrator prefixes it with the round counter
-// and appends the machine-readable marker automatically.
-// Default: a sensible built-in prompt.
-RefinementPrompt string `yaml:"refinement_prompt"`
+	// MergeMethod is the strategy used when auto-merging a PR.
+	// Accepted values: squash, merge, rebase.  Default: "squash".
+	MergeMethod string `yaml:"merge_method"`
 
-// MergeMethod is the strategy used when auto-merging a PR.
-// Accepted values: squash, merge, rebase.  Default: "squash".
-MergeMethod string `yaml:"merge_method"`
+	// MergeCommitMessage is the commit message written when the PR is merged.
+	// Default: "Auto-merged by copilot-autocode".
+	MergeCommitMessage string `yaml:"merge_commit_message"`
 
-// MergeCommitMessage is the commit message written when the PR is merged.
-// Default: "Auto-merged by copilot-autocode".
-MergeCommitMessage string `yaml:"merge_commit_message"`
+	// MergeConflictPrompt is the comment posted on a PR that is behind or has
+	// merge conflicts, asking @copilot to rebase/resolve.
+	MergeConflictPrompt string `yaml:"merge_conflict_prompt"`
 
-// MergeConflictPrompt is the comment posted on a PR that is behind or has
-// merge conflicts, asking @copilot to rebase/resolve.
-MergeConflictPrompt string `yaml:"merge_conflict_prompt"`
+	// MaxMergeConflictRetries is the number of times the orchestrator asks
+	// @copilot to fix merge conflicts before falling back to local AI-powered
+	// resolution.  Default: 3.
+	MaxMergeConflictRetries int `yaml:"max_merge_conflict_retries"`
 
-// CIFixPrompt is the opening instruction sent to @copilot when CI fails.
-// The orchestrator always appends the failing workflow name, job names,
-// and per-job log URLs after this text.
-CIFixPrompt string `yaml:"ci_fix_prompt"`
+	// AIMergeResolverCmd is the executable invoked for local merge-conflict
+	// resolution after @copilot retries are exhausted.  The prompt is passed
+	// as a single argument.  Default: "gemini".
+	AIMergeResolverCmd string `yaml:"ai_merge_resolver_cmd"`
 
-// MaxMergeConflictRetries is the number of times the orchestrator asks
-// @copilot to fix merge conflicts before falling back to local AI-powered
-// resolution.  Default: 3.
-MaxMergeConflictRetries int `yaml:"max_merge_conflict_retries"`
+	// AIMergeResolverPrompt is the text passed to AIMergeResolverCmd.
+	AIMergeResolverPrompt string `yaml:"ai_merge_resolver_prompt"`
 
-// AIMergeResolverCmd is the executable invoked for local merge-conflict
-// resolution after @copilot retries are exhausted.  The prompt is passed
-// as a single argument.  Default: "gemini".
-AIMergeResolverCmd string `yaml:"ai_merge_resolver_cmd"`
+	// CopilotInvokeTimeoutSeconds is how long (in seconds) the orchestrator
+	// waits for the Copilot coding agent to start working on an issue (i.e.
+	// open a PR) before it sends a nudge comment and re-assigns the agent to
+	// re-trigger it.  Minimum: 30.  Default: 600 (10 minutes).
+	CopilotInvokeTimeoutSeconds int `yaml:"copilot_invoke_timeout_seconds"`
 
-// AIMergeResolverPrompt is the text passed to AIMergeResolverCmd.
-AIMergeResolverPrompt string `yaml:"ai_merge_resolver_prompt"`
+	// CopilotInvokeMaxRetries is how many nudge attempts the orchestrator will
+	// make before giving up and returning the issue to the queue.  Default: 3.
+	CopilotInvokeMaxRetries int `yaml:"copilot_invoke_max_retries"`
 
-// CopilotInvokeTimeoutSeconds is how long (in seconds) the orchestrator
-// waits for the Copilot coding agent to start working on an issue (i.e.
-// open a PR) before it sends a nudge comment and re-assigns the agent to
-// re-trigger it.  Minimum: 30.  Default: 600 (10 minutes).
-CopilotInvokeTimeoutSeconds int `yaml:"copilot_invoke_timeout_seconds"`
+	// FallbackIssueInvokePrompt is the task prompt sent directly to the Copilot
+	// API when the coding agent has not started within the timeout.  It is passed
+	// to the same backend that powers the GitHub Agents tab and the
+	// `gh agent-task create` command.  The following placeholders are expanded at
+	// runtime:
+	//
+	//	{issue_number} — the issue number (e.g. 42)
+	//	{issue_title}  — the issue title
+	//	{issue_url}    — the URL of the issue on GitHub
+	//
+	// Default: a built-in prompt that references all three fields.
+	FallbackIssueInvokePrompt string `yaml:"fallback_issue_invoke_prompt"`
 
-// CopilotInvokeMaxRetries is how many nudge attempts the orchestrator will
-// make before giving up and returning the issue to the queue.  Default: 3.
-CopilotInvokeMaxRetries int `yaml:"copilot_invoke_max_retries"`
+	// AgentTimeoutRetryDelaySeconds is how long (in seconds) the orchestrator
+	// waits before posting "@copilot continue" when the Copilot agent's
+	// workflow run concluded with "timed_out".  For non-timeout failures the
+	// continue comment is posted immediately.  Minimum: 60.  Default: 1800
+	// (30 minutes).
+	AgentTimeoutRetryDelaySeconds int `yaml:"agent_timeout_retry_delay_seconds"`
 
-// FallbackIssueInvokePrompt is the task prompt sent directly to the Copilot
-// API when the coding agent has not started within the timeout.  It is passed
-// to the same backend that powers the GitHub Agents tab and the
-// `gh agent-task create` command.  The following placeholders are expanded at
-// runtime:
-//
-//	{issue_number} — the issue number (e.g. 42)
-//	{issue_title}  — the issue title
-//	{issue_url}    — the URL of the issue on GitHub
-//
-// Default: a built-in prompt that references all three fields.
-FallbackIssueInvokePrompt string `yaml:"fallback_issue_invoke_prompt"`
+	// AgentContinuePrompt is the comment posted on a PR when the Copilot
+	// agent's workflow run fails or times out, telling it to resume.
+	// Default: "@copilot continue".
+	AgentContinuePrompt string `yaml:"agent_continue_prompt"`
+
+	// MaxAgentContinueRetries is how many "@copilot continue" comments the
+	// orchestrator will post on a single PR before falling back to the normal
+	// CI-fix flow.  Default: 3.
+	MaxAgentContinueRetries int `yaml:"max_agent_continue_retries"`
+
+	// SkipCIChecks bypasses the CI wait loop when true, merging PRs after
+	// refinement even if tests fail or no workflows exist.  Default: false.
+	SkipCIChecks bool `yaml:"skip_ci_checks"`
 }
 
 // Load reads a YAML config file from path and returns a populated Config with
 // defaults applied.
 func Load(path string) (*Config, error) {
-data, err := os.ReadFile(path)
-if err != nil {
-return nil, fmt.Errorf("read config file %q: %w", path, err)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read config file %q: %w", path, err)
+	}
+
+	cfg := defaultConfig()
+	if err := yaml.Unmarshal(data, cfg); err != nil {
+		return nil, fmt.Errorf("parse config file %q: %w", path, err)
+	}
+	if err := cfg.validate(); err != nil {
+		return nil, err
+	}
+	return cfg, nil
 }
 
-cfg := &Config{
-LabelQueue:                  "ai-queue",
-LabelCoding:                 "ai-coding",
-LabelReview:                 "ai-review",
-CopilotUser:                 "copilot",
-MaxConcurrentIssues:         3,
-PollIntervalSeconds:         45,
-MaxRefinementRounds:         3,
-RefinementPrompt:            "Please review your implementation against all requirements in the original issue and refine anything that is missing or incomplete.",
-MergeMethod:                 "squash",
-MergeCommitMessage:          "Auto-merged by copilot-autocode",
-MergeConflictPrompt:         "@copilot Please merge from main and address any merge conflicts.",
-CIFixPrompt:                 "@copilot Please fix the failing CI checks.",
-MaxMergeConflictRetries:     3,
-AIMergeResolverCmd:          "gemini",
-AIMergeResolverPrompt:       "Please resolve all git merge conflicts in this repository. Make minimal changes to resolve the conflicts while preserving the intent of both sides.",
-CopilotInvokeTimeoutSeconds: 600,
-CopilotInvokeMaxRetries:     3,
-FallbackIssueInvokePrompt:   "Please start working on issue #{issue_number}: {issue_title}.\n{issue_url}",
-}
-if err := yaml.Unmarshal(data, cfg); err != nil {
-return nil, fmt.Errorf("parse config file %q: %w", path, err)
-}
-
-if cfg.GitHubOwner == "" {
-return nil, fmt.Errorf("config: github_owner is required")
-}
-if cfg.GitHubRepo == "" {
-return nil, fmt.Errorf("config: github_repo is required")
-}
-if cfg.MaxConcurrentIssues < 1 {
-cfg.MaxConcurrentIssues = 1
-}
-if cfg.PollIntervalSeconds < 10 {
-cfg.PollIntervalSeconds = 10
-}
-if cfg.MaxRefinementRounds < 0 {
-cfg.MaxRefinementRounds = 0
-}
-switch cfg.MergeMethod {
-case "squash", "merge", "rebase":
-// valid
-default:
-return nil, fmt.Errorf("config: merge_method must be squash, merge, or rebase (got %q)", cfg.MergeMethod)
-}
-if cfg.MaxMergeConflictRetries < 1 {
-cfg.MaxMergeConflictRetries = 1
-}
-if cfg.CopilotInvokeTimeoutSeconds < 30 {
-cfg.CopilotInvokeTimeoutSeconds = 30
-}
-if cfg.CopilotInvokeMaxRetries < 1 {
-cfg.CopilotInvokeMaxRetries = 1
+func defaultConfig() *Config {
+	return &Config{
+		LabelQueue:                    "ai-queue",
+		LabelCoding:                   "ai-coding",
+		LabelReview:                   "ai-review",
+		LabelTakeover:                 "manual-takeover",
+		MaxConcurrentIssues:           defaultMaxConcurrentIssues,
+		PollIntervalSeconds:           defaultPollIntervalSeconds,
+		MaxRefinementRounds:           defaultMaxRefinementRounds,
+		RefinementPrompt:              "Please review your implementation against all requirements in the original issue and refine anything that is missing or incomplete. Please commit and push often so you don't lose work.",
+		MergeMethod:                   "squash",
+		MergeCommitMessage:            "Auto-merged by copilot-autocode",
+		MergeConflictPrompt:           "@copilot Please merge from main and address any merge conflicts. Please commit and push often so you don't lose work.",
+		MaxMergeConflictRetries:       defaultMaxMergeConflictRetries,
+		AIMergeResolverCmd:            "gemini",
+		AIMergeResolverPrompt:         "Please resolve all git merge conflicts in this repository. Make minimal changes to resolve the conflicts while preserving the intent of both sides.",
+		CopilotInvokeTimeoutSeconds:   defaultCopilotInvokeTimeoutSecs,
+		CopilotInvokeMaxRetries:       defaultCopilotInvokeMaxRetries,
+		FallbackIssueInvokePrompt:     "Please start working on issue #{issue_number}: {issue_title}.\n{issue_url}\n\nPlease commit and push often so you don't lose work.",
+		AgentTimeoutRetryDelaySeconds: defaultAgentTimeoutRetryDelaySecs,
+		AgentContinuePrompt:           "@copilot continue. Please commit and push often so you don't lose work.",
+		MaxAgentContinueRetries:       defaultMaxAgentContinueRetries,
+	}
 }
 
-return cfg, nil
+func (c *Config) validate() error {
+	if c.GitHubOwner == "" {
+		return errors.New("config: github_owner is required")
+	}
+	if c.GitHubRepo == "" {
+		return errors.New("config: github_repo is required")
+	}
+	if c.MaxConcurrentIssues < 1 {
+		c.MaxConcurrentIssues = 1
+	}
+	if c.PollIntervalSeconds < minPollIntervalSecs {
+		c.PollIntervalSeconds = minPollIntervalSecs
+	}
+	if c.MaxRefinementRounds < 0 {
+		c.MaxRefinementRounds = 0
+	}
+	switch c.MergeMethod {
+	case "squash", "merge", "rebase":
+	// valid
+	default:
+		return fmt.Errorf("config: merge_method must be squash, merge, or rebase (got %q)", c.MergeMethod)
+	}
+	if c.MaxMergeConflictRetries < 1 {
+		c.MaxMergeConflictRetries = 1
+	}
+	if c.CopilotInvokeTimeoutSeconds < minCopilotInvokeTimeoutSecs {
+		c.CopilotInvokeTimeoutSeconds = minCopilotInvokeTimeoutSecs
+	}
+	if c.CopilotInvokeMaxRetries < 1 {
+		c.CopilotInvokeMaxRetries = 1
+	}
+	if c.AgentTimeoutRetryDelaySeconds < minAgentRetryDelaySecs {
+		c.AgentTimeoutRetryDelaySeconds = minAgentRetryDelaySecs
+	}
+	if c.MaxAgentContinueRetries < 1 {
+		c.MaxAgentContinueRetries = 1
+	}
+	return nil
 }

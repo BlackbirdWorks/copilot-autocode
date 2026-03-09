@@ -5,15 +5,32 @@ import (
 	"strings"
 	"time"
 
-	"github.com/BlackbirdWorks/copilot-autocode/ghclient"
-	"github.com/BlackbirdWorks/copilot-autocode/poller"
 	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+
+	"github.com/BlackbirdWorks/copilot-autocode/ghclient"
+	"github.com/BlackbirdWorks/copilot-autocode/poller"
 )
 
 // PollEvent wraps a poller.Event for delivery into the Bubble Tea message bus.
 type PollEvent struct{ poller.Event }
+
+// Layout and animation constants for the dashboard.
+const (
+	tuiNumCols       = 3  // number of kanban columns
+	tuiSpinnerFPS    = 10 // spinner frames per second
+	tuiChromeRows    = 6  // rows reserved for title, status bar, and borders
+	tuiColMinHeight  = 5  // minimum column height in rows
+	tuiColSidePad    = 8  // total horizontal padding (borders + gutters)
+	tuiColMinWidth   = 20 // minimum column width in characters
+	tuiItemLPad      = 2  // left-indent for item content inside a column
+	tuiItemLineCount = 2  // lines used per item when status sub-line is present
+	tuiSubLinePad    = 4  // sub-line indent: Padding(0,1)(=2) + 2-space indent
+	tuiSubLineMinW   = 5  // minimum useful sub-line content width
+	tuiSecsPerMin    = 60 // seconds per minute for % modulo in formatCountdown
+	tuiStatusMaxLen  = 80 // max characters shown for error/warning messages
+)
 
 // secondTickMsg is fired every second so live countdown timers in item
 // status sub-lines stay up-to-date between poll events.
@@ -38,19 +55,24 @@ type Model struct {
 	lastErr  error
 	lastWarn string // most recent non-fatal warning (e.g. Copilot assignment failure)
 
-	owner string
-	repo  string
+	owner    string
+	repo     string
+	interval int
 }
 
 // New creates a fresh Model.
-func New(owner, repo string) Model {
+func New(owner, repo string, interval int) Model {
 	sp := spinner.New()
-	sp.Spinner = spinner.Dot
+	sp.Spinner = spinner.Spinner{
+		Frames: []string{"|", "/", "-", "\\"},
+		FPS:    time.Second / tuiSpinnerFPS,
+	}
 	sp.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("#00ff87"))
 	return Model{
-		spinner: sp,
-		owner:   owner,
-		repo:    repo,
+		spinner:  sp,
+		owner:    owner,
+		repo:     repo,
+		interval: interval,
 	}
 }
 
@@ -62,7 +84,6 @@ func (m Model) Init() tea.Cmd {
 // Update handles all messages.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
-
 	case tea.KeyMsg:
 		if msg.String() == "ctrl+c" || msg.String() == "q" {
 			return m, tea.Quit
@@ -99,28 +120,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // View renders the full dashboard.
 func (m Model) View() string {
 	if m.width == 0 {
-		return "Initializing…"
+		return "Initializing..."
 	}
 
 	// Reserve space for title (3 lines) + status bar (1 line) + borders (2).
-	colHeight := m.height - 6
-	if colHeight < 5 {
-		colHeight = 5
-	}
-	colWidth := (m.width - 8) / 3
-	if colWidth < 20 {
-		colWidth = 20
-	}
+	colHeight := max(m.height-tuiChromeRows, tuiColMinHeight)
+	colWidth := max((m.width-tuiColSidePad)/tuiNumCols, tuiColMinWidth)
 
 	title := titleStyle.Width(m.width).Render(
-		fmt.Sprintf(" 🤖  Copilot Orchestrator  ·  %s/%s ", m.owner, m.repo),
+		fmt.Sprintf(" [BOT] Copilot Orchestrator - %s/%s ", m.owner, m.repo),
 	)
 
-	queueCol := m.renderColumn("📋  Queue", headerQueue, badgeQueue,
+	queueCol := m.renderColumn("LIST Queue", headerQueue, badgeQueue,
 		m.queue, colWidth, colHeight)
-	codingCol := m.renderColumn("⚙️   Active (Coding)", headerCoding, badgeCoding,
+	codingCol := m.renderColumn("RUN  Active (Coding)", headerCoding, badgeCoding,
 		m.coding, colWidth, colHeight)
-	reviewCol := m.renderColumn("🔍  In Review (CI/Fix)", headerReview, badgeReview,
+	reviewCol := m.renderColumn("TEST In Review (CI/Fix)", headerReview, badgeReview,
 		m.review, colWidth, colHeight)
 
 	columns := lipgloss.JoinHorizontal(lipgloss.Top,
@@ -145,12 +160,12 @@ func (m Model) renderColumn(
 ) string {
 	var sb strings.Builder
 	sb.WriteString(headerSt.Render(header))
-	sb.WriteString(fmt.Sprintf("  (%d)\n", len(states)))
+	fmt.Fprintf(&sb, "  (%d)\n", len(states))
 
 	linesUsed := 2
 	itemsRendered := 0
 	for _, s := range states {
-		item, itemLines := m.renderItem(s, width)
+		item, itemLines := m.RenderItem(s, width)
 		sb.WriteString(item)
 		sb.WriteString("\n")
 		linesUsed += itemLines
@@ -158,7 +173,7 @@ func (m Model) renderColumn(
 		if linesUsed >= height-2 {
 			remaining := len(states) - itemsRendered
 			if remaining > 0 {
-				sb.WriteString(dimItemStyle.Render(fmt.Sprintf("  … %d more", remaining)))
+				sb.WriteString(dimItemStyle.Render(fmt.Sprintf("  ... %d more", remaining)))
 				sb.WriteString("\n")
 			}
 			break
@@ -174,10 +189,10 @@ func (m Model) renderColumn(
 	return columnStyle.Width(width).Height(height).Render(sb.String())
 }
 
-// renderItem renders a single issue as a title line plus an optional status
+// RenderItem renders a single issue as a title line plus an optional status
 // sub-line.  It returns the rendered string and the number of lines it occupies
 // (1 if no status is known, 2 when a status sub-line is present).
-func (m Model) renderItem(s *poller.State, colWidth int) (string, int) {
+func (m Model) RenderItem(s *poller.State, colWidth int) (string, int) {
 	issue := s.Issue
 	numStr := fmt.Sprintf("#%d", issue.GetNumber())
 	title := issue.GetTitle()
@@ -187,24 +202,16 @@ func (m Model) renderItem(s *poller.State, colWidth int) (string, int) {
 
 	prStr := ""
 	if s.PR != nil {
-		prStr = fmt.Sprintf(" → PR#%d", s.PR.GetNumber())
+		prStr = fmt.Sprintf(" -> PR#%d", s.PR.GetNumber())
 	}
 
-	// Effective wrap width inside the column: Width(colWidth) with Padding(0,1)
-	// causes lipgloss to wrap at colWidth-2 (subtracts left and right padding).
 	// Line format: "  <numStr> <title><prStr><agePart>"
-	// Fixed overhead: 2 (indent) + visual width of numStr + 1 (space) + visual widths of prStr and agePart.
-	// Use lipgloss.Width for visual-width measurement so that multi-byte characters
-	// (e.g. the → arrow in prStr) are counted as display columns, not bytes.
-	effectiveWidth := colWidth - 2
-	fixed := 2 + lipgloss.Width(numStr) + 1 + lipgloss.Width(prStr) + lipgloss.Width(agePart)
-	available := effectiveWidth - fixed
-	if available < 1 {
-		available = 1
-	}
+	// Use exactly colWidth-tuiItemLPad for the total content to avoid wrapping.
+	effectiveWidth := colWidth - tuiItemLPad
+	overhead := tuiItemLPad + lipgloss.Width(numStr) + 1 + lipgloss.Width(prStr) + lipgloss.Width(agePart)
+	available := max(effectiveWidth-overhead, 1)
 
-	// Truncate using rune iteration for multi-byte character safety.
-	// The ellipsis "…" is a single display column (despite being 3 UTF-8 bytes).
+	// Truncate title using runes.
 	runes := []rune(title)
 	if len(runes) > available {
 		if available > 1 {
@@ -214,23 +221,42 @@ func (m Model) renderItem(s *poller.State, colWidth int) (string, int) {
 		}
 	}
 
-	num := issueNumStyle.Render(numStr)
-	line := fmt.Sprintf("  %s %s", num, itemStyle.Render(title))
-	if s.PR != nil {
-		line += prNumStyle.Render(prStr)
+	issueHTML := issue.GetHTMLURL()
+	renderedTitle := itemStyle.Render(title)
+
+	// Make Issue Number and Title clickable links (OSC-8).
+	if issueHTML != "" {
+		numStr = issueNumStyle.Render(numStr)
+		numStr = fmt.Sprintf("\x1b]8;;%s\x1b\\%s\x1b]8;;\x1b\\", issueHTML, numStr)
+		renderedTitle = fmt.Sprintf("\x1b]8;;%s\x1b\\%s\x1b]8;;\x1b\\", issueHTML, renderedTitle)
+	} else {
+		numStr = issueNumStyle.Render(numStr)
 	}
+
+	if s.PR != nil {
+		prNum := fmt.Sprintf("PR#%d", s.PR.GetNumber())
+		renderedPR := prNumStyle.Render(prNum)
+		if prHTML := s.PR.GetHTMLURL(); prHTML != "" {
+			renderedPR = fmt.Sprintf("\x1b]8;;%s\x1b\\%s\x1b]8;;\x1b\\", prHTML, renderedPR)
+		}
+		prStr = " -> " + renderedPR
+	}
+
+	line := fmt.Sprintf("  %s %s", numStr, renderedTitle)
+	line += prStr
 	line += dimItemStyle.Render(agePart)
 
 	if s.CurrentStatus == "" {
 		return line, 1
 	}
-	return line + "\n" + m.renderStatusSubLine(s, colWidth), 2
+	// Cap the sub-line height and avoid wrapping too.
+	return line + "\n" + m.RenderStatusSubLine(s, colWidth), tuiItemLineCount
 }
 
-// renderStatusSubLine builds the dim secondary line shown beneath a title line,
+// RenderStatusSubLine builds the dim secondary line shown beneath a title line,
 // containing the current phase and (if applicable) the next action with a live
 // countdown derived from State.NextActionAt.
-func (m Model) renderStatusSubLine(s *poller.State, colWidth int) string {
+func (m Model) RenderStatusSubLine(s *poller.State, colWidth int) string {
 	current := s.CurrentStatus
 	next := s.NextAction
 
@@ -239,23 +265,54 @@ func (m Model) renderStatusSubLine(s *poller.State, colWidth int) string {
 		if until <= 0 {
 			next += " now"
 		} else {
-			next += " in " + formatCountdown(until)
+			next += " in " + FormatCountdown(until)
 		}
 	}
 
 	var text string
-	if next != "" {
-		text = fmt.Sprintf("%s  ·  %s", current, next)
+	agentIcon := ""
+	switch s.AgentStatus {
+	case "pending":
+		agentIcon = " " + m.spinner.View()
+	case "success":
+		agentIcon = " " + lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Render("[OK]")
+	case "failed":
+		agentIcon = " " + lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Render("[X]")
+	}
+
+	parts := []string{}
+	// Prefix with refinement if applicable.
+	if s.RefinementMax > 0 {
+		parts = append(parts, fmt.Sprintf("refinement[%d/%d]", s.RefinementCount, s.RefinementMax))
+	}
+
+	// Add current phase status (CI failing, Waiting for CI, etc).
+	if current != "" {
+		parts = append(parts, current)
+	}
+
+	// Combine all parts with copilot icon.
+	base := strings.Join(parts, " - ")
+	if agentIcon != "" {
+		text = fmt.Sprintf("%s - copilot%s", base, agentIcon)
 	} else {
-		text = current
+		text = base
+	}
+
+	// Append next action if applicable.
+	if next != "" {
+		text += fmt.Sprintf("  ·  %s", next)
 	}
 
 	// Truncate to the column's effective content width minus the 2-space indent.
 	// effectiveWidth = colWidth - 2 (Padding(0,1)) - 2 (sub-line indent).
-	maxWidth := colWidth - 4
-	if maxWidth < 1 {
-		maxWidth = 1
+	maxWidth := max(colWidth-tuiSubLinePad, tuiSubLineMinW)
+
+	// If too long, try shortening "refinement" to "ref"
+	if lipgloss.Width(text) > maxWidth {
+		text = strings.Replace(text, "refinement[", "ref[", 1)
 	}
+
 	runes := []rune(text)
 	if len(runes) > maxWidth {
 		if maxWidth > 1 {
@@ -268,13 +325,13 @@ func (m Model) renderStatusSubLine(s *poller.State, colWidth int) string {
 	return statusLineStyle.Render("  " + text)
 }
 
-// formatCountdown formats a duration as a short human-readable string,
+// FormatCountdown formats a duration as a short human-readable string,
 // e.g. "9m 42s", "1h 3m", "58s".
-func formatCountdown(d time.Duration) string {
+func FormatCountdown(d time.Duration) string {
 	d = d.Round(time.Second)
 	h := int(d.Hours())
-	mins := int(d.Minutes()) % 60
-	secs := int(d.Seconds()) % 60
+	mins := int(d.Minutes()) % tuiSecsPerMin
+	secs := int(d.Seconds()) % tuiSecsPerMin
 	if h > 0 {
 		return fmt.Sprintf("%dh %dm", h, mins)
 	}
@@ -289,34 +346,40 @@ func (m Model) renderStatus() string {
 	var parts []string
 
 	if m.lastRun.IsZero() {
-		parts = append(parts, spin+" Waiting for first poll…")
+		parts = append(parts, spin+" Waiting for first poll...")
 	} else {
-		parts = append(parts, spin+fmt.Sprintf(" Last poll: %s", ghclient.TimeAgo(m.lastRun)))
+		nextPollRun := m.lastRun.Add(time.Duration(m.interval) * time.Second)
+		until := time.Until(nextPollRun)
+		if until <= 0 {
+			parts = append(parts, spin+" Polling now...")
+		} else {
+			parts = append(parts, spin+fmt.Sprintf(" Next poll in %s", FormatCountdown(until)))
+		}
 	}
 
 	total := len(m.queue) + len(m.coding) + len(m.review)
 	parts = append(parts, fmt.Sprintf("Issues tracked: %d", total))
 	parts = append(parts, "Press q / Ctrl-C to quit")
 
-	status := statusBarStyle.Render(strings.Join(parts, "  ·  "))
+	status := statusBarStyle.Render(strings.Join(parts, "  -  "))
 
 	if m.lastErr != nil {
 		errStr := m.lastErr.Error()
-		if len(errStr) > 80 {
-			errStr = errStr[:77] + "…"
+		if len(errStr) > tuiStatusMaxLen {
+			errStr = errStr[:tuiStatusMaxLen-3] + "..."
 		}
 		status = lipgloss.JoinVertical(lipgloss.Left,
 			status,
-			errorStyle.Render("⚠  "+errStr),
+			errorStyle.Render("!  "+errStr),
 		)
 	} else if m.lastWarn != "" {
 		warnStr := m.lastWarn
-		if len(warnStr) > 80 {
-			warnStr = warnStr[:77] + "…"
+		if len(warnStr) > tuiStatusMaxLen {
+			warnStr = warnStr[:tuiStatusMaxLen-3] + "..."
 		}
 		status = lipgloss.JoinVertical(lipgloss.Left,
 			status,
-			warnStyle.Render("⚠  "+warnStr),
+			warnStyle.Render("!  "+warnStr),
 		)
 	}
 	return status

@@ -51,7 +51,10 @@ func RunLocalResolution(ctx context.Context, token string, prd PRDetails, cfg *c
 	}
 
 	// Configure a git identity so the merge commit is accepted.
-	if err := run(ctx, tmpDir, token, "git", "config", "user.email", "copilot-autocode@users.noreply.github.com"); err != nil {
+	if err := run(
+		ctx, tmpDir, token,
+		"git", "config", "user.email", "copilot-autocode@users.noreply.github.com",
+	); err != nil {
 		return fmt.Errorf("git config user.email: %w", err)
 	}
 	if err := run(ctx, tmpDir, token, "git", "config", "user.name", "copilot-autocode"); err != nil {
