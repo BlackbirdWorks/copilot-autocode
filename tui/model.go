@@ -366,7 +366,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "L":
 			m.mergeLogFilePath = m.logFilePath
 			m.mergeLogTailing = true
-			m = m.openLogFile(m.logFilePath)
+			var errCmd tea.Cmd
+			m, errCmd = m.openLogFile(m.logFilePath)
+			if errCmd != nil {
+				return m, errCmd
+			}
 			return m, mergeLogReloadTick()
 		case "v":
 			return m.openMergeLogCmd()
@@ -1247,11 +1251,11 @@ func FormatCountdown(d time.Duration) string {
 const logViewerMaxLines = 500 // max lines to load from the log file
 
 // openLogFile reads the given file and opens the fullscreen viewer.
-func (m Model) openLogFile(path string) Model {
+func (m Model) openLogFile(path string) (Model, tea.Cmd) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		m.actionFeedback = fmt.Sprintf("Cannot open log: %v", err)
-		return m
+		return m, tea.Tick(tuiCopyFeedbackDuration, func(_ time.Time) tea.Msg { return clearActionMsg{} })
 	}
 	lines := strings.Split(string(data), "\n")
 	// Keep only the last logViewerMaxLines lines.
@@ -1262,7 +1266,7 @@ func (m Model) openLogFile(path string) Model {
 	m.logViewerScroll = 0 // 0 = viewing the bottom (most recent)
 	m.logViewerOpen = true
 	m.logViewerTitle = path
-	return m
+	return m, nil
 }
 
 // openMergeLogCmd starts the live-tail merge log viewer for the selected item.
@@ -1270,11 +1274,15 @@ func (m Model) openMergeLogCmd() (tea.Model, tea.Cmd) {
 	s := m.selectedState()
 	if s == nil || s.MergeLogPath == "" {
 		m.actionFeedback = "No merge log available for selected item"
-		return m, nil
+		return m, tea.Tick(tuiCopyFeedbackDuration, func(_ time.Time) tea.Msg { return clearActionMsg{} })
 	}
 	m.mergeLogFilePath = s.MergeLogPath
 	m.mergeLogTailing = true
-	m = m.openLogFile(s.MergeLogPath)
+	var errCmd tea.Cmd
+	m, errCmd = m.openLogFile(s.MergeLogPath)
+	if errCmd != nil {
+		return m, errCmd
+	}
 	return m, mergeLogReloadTick()
 }
 
