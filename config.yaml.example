@@ -77,12 +77,27 @@ fallback_issue_invoke_prompt: "Please start working on issue #{issue_number}: {i
 
 # Number of times @copilot is asked to fix merge conflicts before the
 # orchestrator falls back to running a local AI CLI to resolve them.
+# Set to 0 to disable @copilot retries and always use local resolution.
 max_merge_conflict_retries: 3
+
+# Number of times local AI resolution is retried if it fails to resolve conflicts.
+local_merge_attempts: 2
+
+# Delay (in minutes) between local AI resolution attempts.
+local_merge_delay_minutes: 10
 
 # The AI CLI executable used for local merge-conflict resolution.
 # It is called as: <cmd> "<prompt>" from the root of a fresh clone of the
-# PR branch.  Default: "gemini" (Google Gemini CLI).
-ai_merge_resolver_cmd: "gemini"
+# PR branch.  Default: "copilot".
+ai_merge_resolver_cmd: "copilot"
+
+# Extra arguments inserted between ai_merge_resolver_cmd and the prompt.
+# If the placeholder "{prompt}" appears in any argument, it is replaced with
+# the actual prompt. Otherwise, the prompt is appended at the end.
+ai_merge_resolver_args:
+  - "-p"
+  - "{prompt}"
+  - "--yolo"
 
 # The prompt passed to ai_merge_resolver_cmd.
 ai_merge_resolver_prompt: "Please resolve all git merge conflicts in this repository. Make minimal changes to resolve the conflicts while preserving the intent of both sides."

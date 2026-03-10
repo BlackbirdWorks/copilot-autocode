@@ -37,3 +37,4 @@ config.yaml
 *.txt
 *.log
 *.html
+copilot-autodev

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"log/slog"
 
@@ -98,8 +99,11 @@ func (t *PRTask) SyncBranch(ctx context.Context) (bool, error) {
 }
 
 func (t *PRTask) resolveConflictsLocally(ctx context.Context, _ int) (bool, error) {
-	alreadyTried, _, _ := t.P.gh.HasCommentContaining(ctx, t.PR.GetNumber(), ghclient.LocalResolutionFailedMarker)
-	if alreadyTried {
+	failures, err := t.P.gh.CountLocalResolutionFailures(ctx, t.PR.GetNumber())
+	if err != nil {
+		return false, err
+	}
+	if failures >= t.P.cfg.LocalMergeAttempts {
 		t.Display(IssueDisplayInfo{
 			Current:      "Merge conflicts unresolved — needs manual fix",
 			PR:           t.PR,
@@ -107,6 +111,22 @@ func (t *PRTask) resolveConflictsLocally(ctx context.Context, _ int) (bool, erro
 			MergeLogPath: resolver.LogPath(t.PR.GetNumber()),
 		})
 		return true, nil
+	}
+
+	if failures > 0 {
+		lastFailure, err := t.P.gh.LastLocalResolutionFailureAt(ctx, t.PR.GetNumber())
+		if err != nil {
+			return false, err
+		}
+		delay := time.Duration(t.P.cfg.LocalMergeDelayMinutes) * time.Minute
+		if time.Since(lastFailure) < delay {
+			t.Display(IssueDisplayInfo{
+				Current: fmt.Sprintf("Waiting for local AI merge retry delay (%d min)", t.P.cfg.LocalMergeDelayMinutes),
+				Next:    "Retrying local AI merge resolution",
+				PR:      t.PR,
+			})
+			return true, nil
+		}
 	}
 
 	// Check if this specific SHA was already resolved successfully.

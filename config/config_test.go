@@ -46,6 +46,10 @@ func TestConfigLoad(t *testing.T) {
 				assert.Equal(t, 45, c.PollIntervalSeconds)
 				assert.Equal(t, 3, c.MaxRefinementRounds)
 				assert.Equal(t, 3, c.MaxMergeConflictRetries)
+				assert.Equal(t, 2, c.LocalMergeAttempts)
+				assert.Equal(t, 10, c.LocalMergeDelayMinutes)
+				assert.Equal(t, "copilot", c.AIMergeResolverCmd)
+				assert.Equal(t, []string{"-p", "{prompt}", "--yolo"}, c.AIMergeResolverArgs)
 				assert.Equal(t, 600, c.CopilotInvokeTimeoutSeconds)
 				assert.Equal(t, 3, c.CopilotInvokeMaxRetries)
 				assert.NotEmpty(t, c.FallbackIssueInvokePrompt)
@@ -106,7 +110,9 @@ github_repo: r
 max_concurrent_issues: 0
 poll_interval_seconds: 5
 max_refinement_rounds: -1
-max_merge_conflict_retries: 0
+max_merge_conflict_retries: -1
+local_merge_attempts: 0
+local_merge_delay_minutes: 0
 copilot_invoke_timeout_seconds: 10
 copilot_invoke_max_retries: 0
 `,
@@ -114,7 +120,9 @@ copilot_invoke_max_retries: 0
 				assert.Equal(t, 1, c.MaxConcurrentIssues, "clamped from 0")
 				assert.Equal(t, 10, c.PollIntervalSeconds, "clamped from 5")
 				assert.Equal(t, 0, c.MaxRefinementRounds, "clamped from -1")
-				assert.Equal(t, 1, c.MaxMergeConflictRetries, "clamped from 0")
+				assert.Equal(t, 0, c.MaxMergeConflictRetries, "clamped from -1")
+				assert.Equal(t, 1, c.LocalMergeAttempts, "clamped from 0")
+				assert.Equal(t, 1, c.LocalMergeDelayMinutes, "clamped from 0")
 				assert.Equal(t, 30, c.CopilotInvokeTimeoutSeconds, "clamped from 10")
 				assert.Equal(t, 1, c.CopilotInvokeMaxRetries, "clamped from 0")
 			},

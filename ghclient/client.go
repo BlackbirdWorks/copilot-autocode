@@ -1088,6 +1088,18 @@ func (c *Client) LastMergeConflictContinueAt(ctx context.Context, num int) (time
 	return c.lastCommentWithMarker(ctx, num, MergeConflictContinueCommentMarker)
 }
 
+// CountLocalResolutionFailures returns the number of local resolution failures
+// (identified by LocalResolutionFailedMarker) posted on the given PR.
+func (c *Client) CountLocalResolutionFailures(ctx context.Context, num int) (int, error) {
+	return c.countCommentsWithMarker(ctx, num, LocalResolutionFailedMarker)
+}
+
+// LastLocalResolutionFailureAt returns the timestamp of the most recent
+// local resolution failure comment, or zero time if none exist.
+func (c *Client) LastLocalResolutionFailureAt(ctx context.Context, num int) (time.Time, error) {
+	return c.lastCommentWithMarker(ctx, num, LocalResolutionFailedMarker)
+}
+
 // countCommentsWithMarker counts issue/PR comments containing the given marker.
 func (c *Client) countCommentsWithMarker(ctx context.Context, num int, marker string) (int, error) {
 	return c.countCommentsWithMarkerSince(ctx, num, marker, time.Time{})

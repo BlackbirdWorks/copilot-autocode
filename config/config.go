@@ -15,6 +15,8 @@ const (
 	defaultPollIntervalSeconds        = 45
 	defaultMaxRefinementRounds        = 3
 	defaultMaxMergeConflictRetries    = 3
+	defaultLocalMergeAttempts         = 2
+	defaultLocalMergeDelayMinutes     = 10
 	defaultCopilotInvokeTimeoutSecs   = 600
 	defaultCopilotInvokeMaxRetries    = 3
 	defaultAgentTimeoutRetryDelaySecs = 1800
@@ -76,8 +78,17 @@ type Config struct {
 
 	// MaxMergeConflictRetries is the number of times the orchestrator asks
 	// @copilot to fix merge conflicts before falling back to local AI-powered
-	// resolution.  Default: 3.
+	// resolution.  Set to 0 to disable @copilot retries and always use local.
+	// Default: 3.
 	MaxMergeConflictRetries int `yaml:"max_merge_conflict_retries"`
+
+	// LocalMergeAttempts is the number of times local AI resolution is retried
+	// if it fails. Default: 2.
+	LocalMergeAttempts int `yaml:"local_merge_attempts"`
+
+	// LocalMergeDelayMinutes is the delay between local AI resolution attempts.
+	// Default: 10.
+	LocalMergeDelayMinutes int `yaml:"local_merge_delay_minutes"`
 
 	// AIMergeResolverCmd is the executable invoked for local merge-conflict
 	// resolution after @copilot retries are exhausted.  Default: "gemini".
@@ -192,8 +203,10 @@ func DefaultConfig() *Config {
 		MergeCommitMessage:            "Auto-merged by copilot-autodev",
 		MergeConflictPrompt:           "@copilot Please merge from main and address any merge conflicts. Please commit and push often so you don't lose work.",
 		MaxMergeConflictRetries:       defaultMaxMergeConflictRetries,
-		AIMergeResolverCmd:            "gemini",
-		AIMergeResolverArgs:           nil,
+		LocalMergeAttempts:            defaultLocalMergeAttempts,
+		LocalMergeDelayMinutes:        defaultLocalMergeDelayMinutes,
+		AIMergeResolverCmd:            "copilot",
+		AIMergeResolverArgs:           []string{"-p", "{prompt}", "--yolo"},
 		AIMergeResolverPrompt:         "Please resolve all git merge conflicts in this repository. Make minimal changes to resolve the conflicts while preserving the intent of both sides.",
 		CopilotInvokeTimeoutSeconds:   defaultCopilotInvokeTimeoutSecs,
 		CopilotInvokeMaxRetries:       defaultCopilotInvokeMaxRetries,
@@ -230,8 +243,14 @@ func (c *Config) validate() error {
 	default:
 		return fmt.Errorf("config: merge_method must be squash, merge, or rebase (got %q)", c.MergeMethod)
 	}
-	if c.MaxMergeConflictRetries < 1 {
-		c.MaxMergeConflictRetries = 1
+	if c.MaxMergeConflictRetries < 0 {
+		c.MaxMergeConflictRetries = 0
+	}
+	if c.LocalMergeAttempts < 1 {
+		c.LocalMergeAttempts = 1
+	}
+	if c.LocalMergeDelayMinutes < 1 {
+		c.LocalMergeDelayMinutes = 1
 	}
 	// copilot-cli requires the prompt via -p/--prompt, not as a bare positional arg.
 	// Auto-set args when the user pointed at "copilot" but left args empty.
