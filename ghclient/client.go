@@ -57,9 +57,14 @@ const (
 	MergeConflictContinueCommentMarker = "<!-- copilot-autocode:merge-conflict-continue -->"
 
 	// LocalResolutionCommentMarker is embedded in the notice posted after a
-	// local AI merge resolution attempt.  Counting these comments tells the
-	// orchestrator how many local resolution attempts have been made.
+	// local AI merge resolution attempt (both success and failure).
 	LocalResolutionCommentMarker = "<!-- copilot-autocode:local-resolution -->"
+
+	// LocalResolutionFailedMarker is embedded only in failure notices.  The
+	// orchestrator checks for this marker to avoid retrying after a failure,
+	// while still allowing re-runs if a previous resolution succeeded but new
+	// conflicts arise later.
+	LocalResolutionFailedMarker = "<!-- copilot-autocode:local-resolution-failed -->"
 
 	// PRLinkCommentMarker is embedded in an issue comment to explicitly link it to a PR.
 	PRLinkCommentMarker = "<!-- copilot-autocode:pr-link:"
@@ -262,7 +267,13 @@ func (c *Client) CloseIssue(ctx context.Context, issueNum int) error {
 	return err
 }
 
-func isMatchForIssue(pr *github.PullRequest, bodyRe, titleRe, branchRe *regexp.Regexp) bool {
+// IsMatchForIssue returns true if the PR's title, body, or head branch reference
+// the given issue number.
+func (c *Client) IsMatchForIssue(pr *github.PullRequest, issueNum int) bool {
+	bodyRe := regexp.MustCompile(fmt.Sprintf(`(?i)(?:^|\s)(?:fixes|closes|resolves)\s+#%d\b`, issueNum))
+	titleRe := regexp.MustCompile(fmt.Sprintf(`(?i)(?:^|\s)#%d\b`, issueNum))
+	branchRe := regexp.MustCompile(fmt.Sprintf(`(?i)(?:^|/)(?:issue-?)?%d(?:[-/]|$)`, issueNum))
+
 	if bodyRe.MatchString(pr.GetBody()) || titleRe.MatchString(pr.GetTitle()) {
 		return true
 	}
@@ -272,9 +283,9 @@ func isMatchForIssue(pr *github.PullRequest, bodyRe, titleRe, branchRe *regexp.R
 	return branchRe.MatchString(branch)
 }
 
-// findLinkedPRFromComments scans an issue's comments for the PRLinkCommentMarker.
+// FindLinkedPRFromComments scans an issue's comments for the PRLinkCommentMarker.
 // If found, it parses the PR number and returns it.
-func (c *Client) findLinkedPRFromComments(ctx context.Context, issueNum int) (int, error) {
+func (c *Client) FindLinkedPRFromComments(ctx context.Context, issueNum int) (int, error) {
 	opts := &github.IssueListCommentsOptions{ListOptions: github.ListOptions{PerPage: perPageDefault}}
 	for {
 		comments, resp, err := c.gh.Issues.ListComments(ctx, c.owner, c.repo, issueNum, opts)
@@ -315,32 +326,29 @@ func (c *Client) OpenPRForIssue(ctx context.Context, issue *github.Issue) (*gith
 	}
 
 	// 2. Proactive discovery via Copilot Job ID.
-	if pr := c.discoverPRViaJobID(ctx, issueNum); pr != nil {
+	if pr := c.DiscoverPRViaJobID(ctx, issueNum); pr != nil {
 		return pr, nil
 	}
 
 	// 3. Search for the explicit link marker on the PR side.
-	if pr := c.findPRByMarkerComment(ctx, issueNum); pr != nil {
+	if pr := c.FindPRByMarkerComment(ctx, issueNum); pr != nil {
 		return pr, nil
 	}
 
 	// 4. Native GitHub Search by issue number (body/title/comments).
 	// Initial discovery (text-matching heuristics).
-	bodyRe := regexp.MustCompile(fmt.Sprintf(`(?i)#%d\b`, issueNum))
-	titleRe := regexp.MustCompile(fmt.Sprintf(`(?i)#%d\b`, issueNum))
-	branchRe := regexp.MustCompile(fmt.Sprintf(`(?i)(?:^|/)(?:issue-?)?%d(?:[-/]|$)`, issueNum))
 
-	if pr := c.findPRBySearch(ctx, issueNum, bodyRe, titleRe, branchRe); pr != nil {
+	if pr := c.FindPRBySearch(ctx, issueNum); pr != nil {
 		return pr, nil
 	}
 
 	// 5. Fallback: list recent PRs and look for issue number.
-	if pr := c.findPRByListing(ctx, issueNum, bodyRe, titleRe, branchRe); pr != nil {
+	if pr := c.FindPRByListing(ctx, issueNum); pr != nil {
 		return pr, nil
 	}
 
 	// 6. Issue timeline: scan for cross-reference events from a PR.
-	if pr, err := c.findPRFromTimeline(ctx, issueNum); err == nil && pr != nil {
+	if pr, err := c.FindPRFromTimeline(ctx, issueNum); err == nil && pr != nil {
 		c.ensureTwoWayLink(ctx, issueNum, pr.GetNumber())
 		return pr, nil
 	} else if err != nil {
@@ -353,7 +361,7 @@ func (c *Client) OpenPRForIssue(ctx context.Context, issue *github.Issue) (*gith
 }
 
 func (c *Client) findPRByIssueComment(ctx context.Context, issueNum int) (*github.PullRequest, error) {
-	linkedPRNum, err := c.findLinkedPRFromComments(ctx, issueNum)
+	linkedPRNum, err := c.FindLinkedPRFromComments(ctx, issueNum)
 	if err != nil {
 		logger.Load(ctx).ErrorContext(ctx, "issue step 1 error", slog.Int("issue", issueNum), slog.Any("err", err))
 		return nil, err
@@ -371,7 +379,7 @@ func (c *Client) findPRByIssueComment(ctx context.Context, issueNum int) (*githu
 	return nil, nil
 }
 
-func (c *Client) findPRByMarkerComment(ctx context.Context, issueNum int) *github.PullRequest {
+func (c *Client) FindPRByMarkerComment(ctx context.Context, issueNum int) *github.PullRequest {
 	markerText := fmt.Sprintf("copilot-autocode:issue-link:%d", issueNum)
 	markerQuery := fmt.Sprintf("repo:%s/%s is:pr is:open %s", c.owner, c.repo, markerText)
 	markerResult, _, err := c.gh.Search.Issues(ctx, markerQuery, nil)
@@ -391,15 +399,14 @@ func (c *Client) findPRByMarkerComment(ctx context.Context, issueNum int) *githu
 	return nil
 }
 
-func (c *Client) findPRBySearch(ctx context.Context, issueNum int,
-	bodyRe, titleRe, branchRe *regexp.Regexp) *github.PullRequest {
+func (c *Client) FindPRBySearch(ctx context.Context, issueNum int) *github.PullRequest {
 	query := fmt.Sprintf("repo:%s/%s is:pr is:open %d", c.owner, c.repo, issueNum)
 	result, _, err := c.gh.Search.Issues(ctx, query, nil)
 	if err != nil {
 		logger.Load(ctx).ErrorContext(ctx, "issue step 4 error", slog.Int("issue", issueNum), slog.Any("err", err))
 		return nil
 	}
-	if pr := c.findMatchInSearchResults(ctx, issueNum, result.Issues, bodyRe, titleRe, branchRe); pr != nil {
+	if pr := c.FindMatchInSearchResults(ctx, issueNum, result.Issues); pr != nil {
 		return pr
 	}
 	logger.Load(ctx).InfoContext(ctx, "issue step 4 no matches",
@@ -407,8 +414,7 @@ func (c *Client) findPRBySearch(ctx context.Context, issueNum int,
 	return nil
 }
 
-func (c *Client) findPRByListing(ctx context.Context, issueNum int,
-	bodyRe, titleRe, branchRe *regexp.Regexp) *github.PullRequest {
+func (c *Client) FindPRByListing(ctx context.Context, issueNum int) *github.PullRequest {
 	prs, _, err := c.gh.PullRequests.List(ctx, c.owner, c.repo, &github.PullRequestListOptions{
 		State:       prStateOpen,
 		ListOptions: github.ListOptions{PerPage: perPageMedium},
@@ -418,7 +424,7 @@ func (c *Client) findPRByListing(ctx context.Context, issueNum int,
 		return nil
 	}
 	for _, pr := range prs {
-		if isMatchForIssue(pr, bodyRe, titleRe, branchRe) {
+		if c.IsMatchForIssue(pr, issueNum) {
 			c.ensureTwoWayLink(ctx, issueNum, pr.GetNumber())
 			return pr
 		}
@@ -428,7 +434,7 @@ func (c *Client) findPRByListing(ctx context.Context, issueNum int,
 	return nil
 }
 
-func (c *Client) discoverPRViaJobID(ctx context.Context, issueNum int) *github.PullRequest {
+func (c *Client) DiscoverPRViaJobID(ctx context.Context, issueNum int) *github.PullRequest {
 	jobID, _ := c.LatestCopilotJobID(ctx, issueNum)
 	if jobID == "" {
 		return nil
@@ -451,10 +457,10 @@ func (c *Client) discoverPRViaJobID(ctx context.Context, issueNum int) *github.P
 	return nil
 }
 
-// findPRFromTimeline scans the issue's timeline for cross-reference events
+// FindPRFromTimeline scans the issue's timeline for cross-reference events
 // originating from an open PR. This works immediately when a PR body says
 // "Fixes #N", without waiting for search indexing or relying on text matching.
-func (c *Client) findPRFromTimeline(ctx context.Context, issueNum int) (*github.PullRequest, error) {
+func (c *Client) FindPRFromTimeline(ctx context.Context, issueNum int) (*github.PullRequest, error) {
 	opts := &github.ListOptions{PerPage: perPageDefault}
 	for {
 		events, resp, err := c.gh.Issues.ListIssueTimeline(ctx, c.owner, c.repo, issueNum, opts)
@@ -490,11 +496,10 @@ func (c *Client) findPRFromTimeline(ctx context.Context, issueNum int) (*github.
 	return nil, nil
 }
 
-// findMatchInSearchResults iterates GitHub search results and returns the first
+// FindMatchInSearchResults iterates GitHub search results and returns the first
 // open PR that matches the issue by body/title/branch regex.
-func (c *Client) findMatchInSearchResults(
+func (c *Client) FindMatchInSearchResults(
 	ctx context.Context, issueNum int, issues []*github.Issue,
-	bodyRe, titleRe, branchRe *regexp.Regexp,
 ) *github.PullRequest {
 	for _, sr := range issues {
 		if sr.PullRequestLinks == nil || sr.GetNumber() == issueNum {
@@ -504,7 +509,7 @@ func (c *Client) findMatchInSearchResults(
 		if err != nil {
 			continue
 		}
-		if pr.GetState() == prStateOpen && isMatchForIssue(pr, bodyRe, titleRe, branchRe) {
+		if pr.GetState() == prStateOpen && c.IsMatchForIssue(pr, issueNum) {
 			c.ensureTwoWayLink(ctx, issueNum, pr.GetNumber())
 			return pr
 		}
@@ -968,7 +973,7 @@ func (c *Client) ApproveWorkflowRun(ctx context.Context, runID int64) error {
 	req.Header.Set("Authorization", "Bearer "+c.token)
 	req.Header.Set("Accept", "application/vnd.github.v3+json")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := c.httpClient().Do(req)
 	if err != nil {
 		return fmt.Errorf("approve run %d: %w", runID, err)
 	}
@@ -992,9 +997,40 @@ func (c *Client) ApproveWorkflowRun(ctx context.Context, runID int64) error {
 }
 
 // CountCIFixPromptsSent returns the number of CI-fix-only prompts posted on
-// the given PR by counting comments containing CIFixCommentMarker.
+// the given PR by counting comments containing CIFixCommentMarker that were
+// posted after the most recent successful local merge resolution.
 func (c *Client) CountCIFixPromptsSent(ctx context.Context, prNum int) (int, error) {
-	return c.countCommentsWithMarker(ctx, prNum, CIFixCommentMarker)
+	lastRes, err := c.LastSuccessfulLocalResolutionAt(ctx, prNum)
+	if err != nil {
+		return 0, err
+	}
+	return c.countCommentsWithMarkerSince(ctx, prNum, CIFixCommentMarker, lastRes)
+}
+
+// LastSuccessfulLocalResolutionAt returns the timestamp of the most recent
+// successful local merge resolution comment.
+func (c *Client) LastSuccessfulLocalResolutionAt(ctx context.Context, num int) (time.Time, error) {
+	var latest time.Time
+	opts := &github.IssueListCommentsOptions{ListOptions: github.ListOptions{PerPage: perPageDefault}}
+	for {
+		comments, resp, err := c.gh.Issues.ListComments(ctx, c.owner, c.repo, num, opts)
+		if err != nil {
+			return time.Time{}, fmt.Errorf("list comments (#%d): %w", num, err)
+		}
+		for _, cm := range comments {
+			body := cm.GetBody()
+			if strings.Contains(body, LocalResolutionCommentMarker) && !strings.Contains(body, LocalResolutionFailedMarker) {
+				if t := cm.GetCreatedAt().Time; t.After(latest) {
+					latest = t
+				}
+			}
+		}
+		if resp.NextPage == 0 {
+			break
+		}
+		opts.Page = resp.NextPage
+	}
+	return latest, nil
 }
 
 // CountAgentContinueComments returns the number of "@copilot continue"
@@ -1026,6 +1062,12 @@ func (c *Client) LastMergeConflictContinueAt(ctx context.Context, num int) (time
 
 // countCommentsWithMarker counts issue/PR comments containing the given marker.
 func (c *Client) countCommentsWithMarker(ctx context.Context, num int, marker string) (int, error) {
+	return c.countCommentsWithMarkerSince(ctx, num, marker, time.Time{})
+}
+
+// countCommentsWithMarkerSince counts issue/PR comments containing the given marker
+// that were created after the given time (or all if since is zero).
+func (c *Client) countCommentsWithMarkerSince(ctx context.Context, num int, marker string, since time.Time) (int, error) {
 	count := 0
 	opts := &github.IssueListCommentsOptions{ListOptions: github.ListOptions{PerPage: perPageDefault}}
 	for {
@@ -1035,7 +1077,9 @@ func (c *Client) countCommentsWithMarker(ctx context.Context, num int, marker st
 		}
 		for _, cm := range comments {
 			if strings.Contains(cm.GetBody(), marker) {
-				count++
+				if since.IsZero() || cm.GetCreatedAt().Time.After(since) {
+					count++
+				}
 			}
 		}
 		if resp.NextPage == 0 {
@@ -1112,9 +1156,6 @@ func (c *Client) MergedPRForIssue(ctx context.Context, issue *github.Issue) (*gi
 	if err != nil {
 		return nil, err
 	}
-	bodyRe := regexp.MustCompile(fmt.Sprintf(`(?i)(?:^|\s)(?:fixes|resolves|closes)\s+#%d\b`, issueNum))
-	titleRe := regexp.MustCompile(fmt.Sprintf(`(?i)(?:^|\s)#%d\b`, issueNum))
-	branchRe := regexp.MustCompile(fmt.Sprintf(`(?i)(?:^|/)(?:issue-?)?%d(?:[-/]|$)`, issueNum))
 
 	for _, sr := range result.Issues {
 		if sr.PullRequestLinks != nil && sr.GetNumber() != issueNum {
@@ -1123,7 +1164,7 @@ func (c *Client) MergedPRForIssue(ctx context.Context, issue *github.Issue) (*gi
 				continue
 			}
 			if pr.GetMerged() {
-				if isMatchForIssue(pr, bodyRe, titleRe, branchRe) {
+				if c.IsMatchForIssue(pr, issueNum) {
 					return pr, nil
 				}
 			}
@@ -1141,7 +1182,7 @@ func (c *Client) MergedPRForIssue(ctx context.Context, issue *github.Issue) (*gi
 		if !pr.GetMerged() {
 			continue
 		}
-		if isMatchForIssue(pr, bodyRe, titleRe, branchRe) {
+		if c.IsMatchForIssue(pr, issueNum) {
 			return pr, nil
 		}
 	}
@@ -1471,7 +1512,7 @@ func (c *Client) MarkPRReady(ctx context.Context, pr *github.PullRequest) error 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+c.token)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := c.httpClient().Do(req)
 	if err != nil {
 		return fmt.Errorf("mark PR ready: %w", err)
 	}
@@ -1527,6 +1568,29 @@ func (c *Client) HasCommentContaining(ctx context.Context, num int, needle strin
 		opts.Page = resp.NextPage
 	}
 	return false, time.Time{}, nil
+}
+
+// DeleteCommentContaining finds the first comment on an issue/PR whose body
+// contains needle and deletes it.  Returns nil if no matching comment exists.
+func (c *Client) DeleteCommentContaining(ctx context.Context, num int, needle string) error {
+	opts := &github.IssueListCommentsOptions{ListOptions: github.ListOptions{PerPage: perPageDefault}}
+	for {
+		comments, resp, err := c.gh.Issues.ListComments(ctx, c.owner, c.repo, num, opts)
+		if err != nil {
+			return err
+		}
+		for _, cm := range comments {
+			if strings.Contains(cm.GetBody(), needle) {
+				_, err := c.gh.Issues.DeleteComment(ctx, c.owner, c.repo, cm.GetID())
+				return err
+			}
+		}
+		if resp.NextPage == 0 {
+			break
+		}
+		opts.Page = resp.NextPage
+	}
+	return nil
 }
 
 // SHAMarker returns a marker string that embeds a commit SHA prefix, used

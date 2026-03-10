@@ -83,13 +83,15 @@ func main() {
 
 	gh := ghclient.New(token, cfg)
 
-	// Create the Bubble Tea model.
-	model := tui.New(cfg.GitHubOwner, cfg.GitHubRepo, cfg.PollIntervalSeconds)
+	// Create and start the background poller.
+	p := poller.New(cfg, gh, token)
+
+	// Create the Bubble Tea model with the poller's command channel.
+	model := tui.New(cfg.GitHubOwner, cfg.GitHubRepo, cfg.PollIntervalSeconds, p.Commands)
 
 	prog := tea.NewProgram(
 		model,
 		tea.WithAltScreen(),
-		tea.WithMouseCellMotion(),
 	)
 
 	// Configure slog to forward to both the TUI and a local log file.
@@ -119,8 +121,6 @@ func main() {
 
 	logger.Load(ctx).InfoContext(ctx, "Copilot Orchestrator starting...")
 
-	// Create and start the background poller.
-	p := poller.New(cfg, gh, token)
 	p.Start(ctx)
 
 	// Bridge poller events → Bubble Tea messages in a goroutine.

@@ -12,17 +12,23 @@ var (
 	headerCoding = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#e4b800")).Padding(0, 1)
 	headerReview = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#d93f0b")).Padding(0, 1)
 
-	// Column container.
+	// Column containers.
 	columnStyle = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(lipgloss.Color("#444444")).
 			Padding(0, 1)
+
+	selectedColumnStyle = lipgloss.NewStyle().
+				Border(lipgloss.RoundedBorder()).
+				BorderForeground(lipgloss.Color("#00ff87")). // Vibrant Copilot green
+				Padding(0, 1)
 
 	// Item styles.
 	itemStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("#dddddd"))
 	dimItemStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("#777777"))
 	issueNumStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#aaaaaa"))
 	prNumStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#5a9fe8"))
+	codeSpanStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#d2a8ff")) // GitHub magenta code span color
 
 	// Status sub-line style: muted text shown below each item's title line,
 	// describing the current phase and next scheduled action.
@@ -70,4 +76,13 @@ var (
 			Padding(0, 1)
 
 	logLineStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#888888"))
+
+	// Log level parsing styles.
+	logInfoStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("#5a9fe8")) // Blue
+	logWarnStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("#e4b800")) // Yellow
+	logErrorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#ff5555")) // Red
+	logDebugStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#aaaaaa")) // Gray
+
+	// Selected item indicator prefix.
+	selectedIndicator = lipgloss.NewStyle().Foreground(lipgloss.Color("#00ff87")).Bold(true)
 )

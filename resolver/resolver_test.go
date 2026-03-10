@@ -3,6 +3,7 @@ package resolver_test
 import (
 	"context"
 	"errors"
+	"io"
 	"strings"
 	"testing"
 
@@ -19,7 +20,7 @@ type mockRunner struct {
 	calls      []string
 }
 
-func (m *mockRunner) Run(ctx context.Context, dir, token, name string, args ...string) error {
+func (m *mockRunner) Run(ctx context.Context, out io.Writer, dir, token, name string, args ...string) error {
 	m.calls = append(m.calls, name+" "+strings.Join(args, " "))
 	if m.runFunc != nil {
 		return m.runFunc(ctx, dir, token, name, args...)
@@ -64,6 +65,9 @@ func TestRunLocalResolution(t *testing.T) {
 				if name == "git" && args[0] == "diff" {
 					return "file1.go\n", nil
 				}
+				if name == "git" && args[0] == "rev-parse" {
+					return "abcd1234efgh5678\n", nil
+				}
 				return "", nil
 			},
 			expectedCalls: []string{
@@ -71,11 +75,12 @@ func TestRunLocalResolution(t *testing.T) {
 				"git config user.email copilot-autocode@users.noreply.github.com",
 				"git config user.name copilot-autocode",
 				"git fetch origin base",
-				"git merge --no-edit origin/base",
+				"git merge --no-edit FETCH_HEAD",
 				"ai-resolve resolve conflicts",
 				"git add --all",
 				"git diff --cached --name-only",
 				"git commit -m chore: resolve merge conflicts via AI",
+				"git rev-parse HEAD",
 				"git push origin head",
 			},
 		},
@@ -189,7 +194,7 @@ func TestRunLocalResolution(t *testing.T) {
 				outputFunc: tt.outputFunc,
 			}
 			r := resolver.NewWithRunner(m)
-			err := r.RunLocalResolution(context.Background(), token, prd, cfg)
+			newSha, err := r.RunLocalResolution(context.Background(), token, prd, cfg, 123)
 
 			if tt.wantErr {
 				require.Error(t, err)
@@ -198,6 +203,7 @@ func TestRunLocalResolution(t *testing.T) {
 				}
 			} else {
 				require.NoError(t, err)
+				assert.Equal(t, "abcd1234efgh5678", newSha)
 			}
 
 			if len(tt.expectedCalls) > 0 {
@@ -220,7 +226,7 @@ func TestRealRunner(t *testing.T) {
 
 	// We can't easily run real commands in CI without side effects,
 	// but we can test that they return an error for non-existent commands.
-	err := rr.Run(ctx, ".", "", "non-existent-command-12345")
+	err := rr.Run(ctx, nil, ".", "", "non-existent-command-12345")
 	require.Error(t, err)
 
 	_, err = rr.Output(ctx, ".", "non-existent-command-12345")

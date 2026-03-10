@@ -80,9 +80,17 @@ type Config struct {
 	MaxMergeConflictRetries int `yaml:"max_merge_conflict_retries"`
 
 	// AIMergeResolverCmd is the executable invoked for local merge-conflict
-	// resolution after @copilot retries are exhausted.  The prompt is passed
-	// as a single argument.  Default: "gemini".
+	// resolution after @copilot retries are exhausted.  Default: "gemini".
+	// Example: "gh" with AIMergeResolverArgs: ["copilot", "suggest", "-t", "shell"]
 	AIMergeResolverCmd string `yaml:"ai_merge_resolver_cmd"`
+
+	// AIMergeResolverArgs are extra arguments inserted between AIMergeResolverCmd
+	// and the prompt.  Useful for multi-word CLI tools like `gh copilot suggest`.
+	// If the placeholder "{prompt}" appears in any argument, it is replaced with
+	// the actual prompt. Otherwise, the prompt is appended at the end.
+	// Example: ["-p", "{prompt}", "--yolo"] results in: <cmd> -p <prompt> --yolo.
+	// Default: empty (for gemini-style single-arg CLIs).
+	AIMergeResolverArgs []string `yaml:"ai_merge_resolver_args"`
 
 	// AIMergeResolverPrompt is the text passed to AIMergeResolverCmd.
 	AIMergeResolverPrompt string `yaml:"ai_merge_resolver_prompt"`
@@ -154,7 +162,7 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("read config file %q: %w", path, err)
 	}
 
-	cfg := defaultConfig()
+	cfg := DefaultConfig()
 	if err := yaml.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("parse config file %q: %w", path, err)
 	}
@@ -164,7 +172,8 @@ func Load(path string) (*Config, error) {
 	return cfg, nil
 }
 
-func defaultConfig() *Config {
+// DefaultConfig returns a Config populated with all built-in default values.
+func DefaultConfig() *Config {
 	return &Config{
 		LabelQueue:                    "ai-queue",
 		LabelCoding:                   "ai-coding",
@@ -179,6 +188,7 @@ func defaultConfig() *Config {
 		MergeConflictPrompt:           "@copilot Please merge from main and address any merge conflicts. Please commit and push often so you don't lose work.",
 		MaxMergeConflictRetries:       defaultMaxMergeConflictRetries,
 		AIMergeResolverCmd:            "gemini",
+		AIMergeResolverArgs:           nil,
 		AIMergeResolverPrompt:         "Please resolve all git merge conflicts in this repository. Make minimal changes to resolve the conflicts while preserving the intent of both sides.",
 		CopilotInvokeTimeoutSeconds:   defaultCopilotInvokeTimeoutSecs,
 		CopilotInvokeMaxRetries:       defaultCopilotInvokeMaxRetries,
@@ -216,6 +226,11 @@ func (c *Config) validate() error {
 	}
 	if c.MaxMergeConflictRetries < 1 {
 		c.MaxMergeConflictRetries = 1
+	}
+	// copilot-cli requires the prompt via -p/--prompt, not as a bare positional arg.
+	// Auto-set args when the user pointed at "copilot" but left args empty.
+	if c.AIMergeResolverCmd == "copilot" && len(c.AIMergeResolverArgs) == 0 {
+		c.AIMergeResolverArgs = []string{"-p"}
 	}
 	if c.CopilotInvokeTimeoutSeconds < minCopilotInvokeTimeoutSecs {
 		c.CopilotInvokeTimeoutSeconds = minCopilotInvokeTimeoutSecs

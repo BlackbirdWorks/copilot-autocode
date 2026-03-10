@@ -107,41 +107,132 @@ To enqueue an issue, simply add the `ai-queue` label to it.
 
 ```
 main.go
- ├── config/config.go       – YAML config loader
- ├── ghclient/client.go     – go-github wrapper (all GitHub API calls)
- ├── poller/poller.go       – state machine (runs as background goroutine)
+ ├── config/config.go         – YAML config loader
+ ├── ghclient/client.go       – go-github wrapper (all GitHub API calls)
+ ├── poller/
+ │   ├── poller.go            – state machine + command channel (background goroutine)
+ │   └── task.go              – per-PR pipeline (sync → CI → fix → refine → merge)
+ ├── resolver/resolver.go     – local merge-conflict resolution via AI CLI
+ ├── pkgs/
+ │   ├── logger/              – context-aware slog helpers
+ │   └── rotatinglog/         – size-based rotating log file writer
  └── tui/
-     ├── model.go           – Bubble Tea model & Update/View
-     └── style.go           – lipgloss styles
+     ├── model.go             – Bubble Tea model, Update/View, log viewer overlay
+     └── style.go             – lipgloss styles
 ```
 
 ### State Machine
 
+```mermaid
+stateDiagram-v2
+    [*] --> Queue : Add ai‑queue label
+
+    state Queue {
+        [*] --> Waiting
+        Waiting --> Promoting : Slot available
+    }
+
+    Queue --> Coding : promoteFromQueue
+
+    state Coding {
+        [*] --> WaitForPR
+        WaitForPR --> NudgeCopilot : Timeout (copilot_invoke_timeout_seconds)
+        NudgeCopilot --> WaitForPR : Re‑assign agent
+        NudgeCopilot --> ReturnToQueue : Max retries exceeded
+        WaitForPR --> WaitForDraft : PR opened (draft)
+        WaitForDraft --> ReadyForReview : PR marked ready / no active agent run
+    }
+
+    Coding --> Queue : ReturnToQueue
+    Coding --> Review : ReadyForReview (swap ai‑coding → ai‑review)
+
+    state Review {
+        [*] --> SyncBranch
+
+        state SyncBranch {
+            [*] --> CheckMergeable
+            CheckMergeable --> PostMergeComment : Branch behind / conflicts
+            PostMergeComment --> WaitForAgent : @copilot merge from main
+            WaitForAgent --> CheckMergeable : Agent finished
+            CheckMergeable --> LocalMergeResolution : Conflicts persist after N attempts
+            LocalMergeResolution --> CheckMergeable : AI resolver succeeds
+            LocalMergeResolution --> NeedsManualFix : AI resolver fails
+        }
+
+        SyncBranch --> ApproveRuns : Branch clean
+        ApproveRuns --> WaitForCI : Approve pending workflow runs
+
+        state WaitForCI {
+            [*] --> Polling
+            Polling --> CIGreen : All checks pass
+            Polling --> CIFailed : Check(s) failed
+            Polling --> CITimeout : Workflow timed out
+        }
+
+        WaitForCI --> FixCI : CIFailed
+        WaitForCI --> Refine : CIGreen (refinement rounds remaining)
+        WaitForCI --> Merge : CIGreen (all rounds done)
+        WaitForCI --> HandleTimeout : CITimeout
+
+        state FixCI {
+            [*] --> PostFixComment
+            PostFixComment --> WaitForAgent2 : @copilot fix failing tests
+            WaitForAgent2 --> SyncBranch : Agent finished → re‑check
+        }
+
+        state Refine {
+            [*] --> PostRefineComment
+            PostRefineComment --> WaitForAgent3 : @copilot review against requirements
+            WaitForAgent3 --> SyncBranch : Agent finished → re‑check CI
+        }
+
+        HandleTimeout --> RerunWorkflow : Rerun timed‑out workflow
+        RerunWorkflow --> WaitForCI
+
+        Merge --> [*] : Approve + squash‑merge + close issue
+    }
+
+    Review --> [*] : Merged
+    NeedsManualFix --> Review : Retry via TUI (r key)
 ```
-         ┌──────────┐
-         │ ai-queue │  ← label added manually by human
-         └────┬─────┘
-              │  promoteFromQueue (slots available)
-              ▼
-         ┌───────────┐
-         │ ai-coding │  + assign copilot user
-         └────┬──────┘
-              │  PR no longer draft && no active agent run
-              │
-              │  [no PR after copilot_invoke_timeout_seconds?]
-              │  → post nudge comment (@<copilot_user>) + re-assign
-              │  → after copilot_invoke_max_retries: return to ai-queue
-              ▼
-         ┌───────────┐
-         │ ai-review │
-         └────┬──────┘
-         ┌────┴──────────────────────────────┐
-         │                                   │
-    branch behind?                    CI status?
-         │                                   │
-   post @copilot            failure (×∞) → post fix request
-   merge comment            success → approve + merge + close
-```
+
+#### Legend
+
+| State | Description |
+|-------|-------------|
+| **Queue** | Issue labelled `ai-queue`, waiting for a concurrency slot |
+| **Coding** | Copilot agent is writing code; orchestrator nudges if it stalls |
+| **Review** | PR open — sync branch, run CI, fix failures, refine, then merge |
+| **LocalMergeResolution** | Configurable AI CLI (e.g. Gemini) resolves merge conflicts locally |
+| **FixCI** | Posts `@copilot fix …` with failure logs; unlimited retries |
+| **Refine** | Posts `@copilot review …` against original requirements (3 rounds) |
+
+---
+
+## Roadmap
+
+1. **Desktop notifications** — Native OS notifications (via `beeep` or similar)
+   when PRs merge, agents time out, or merge conflicts need manual intervention.
+   Keeps you informed without watching the TUI full-time.
+
+2. **Issue detail pane** — Press `Enter` on a selected item to expand a detail
+   panel showing PR description, per-workflow CI status, refinement history,
+   and the full comment timeline.
+
+3. **Manual takeover from TUI** — Press `t` to add a `manual-takeover` label
+   that pauses the orchestrator for that issue, letting a human step in
+   without fighting the bot.
+
+4. **Force re-run CI from TUI** — Press `f` to re-run failed or stale
+   workflows directly from the dashboard (wired to the existing
+   `RerunWorkflow` method).
+
+5. **Priority reordering** — Press `+`/`-` to bump issues up or down in
+   the queue column, controlling which issues get promoted first.
+
+6. **Activity feed / timeline** — A per-item event timeline built from
+   comment timestamps, showing every orchestrator action (nudge, fix,
+   refine, merge attempt) with relative timestamps.
 
 ---
 

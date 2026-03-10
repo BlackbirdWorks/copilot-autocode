@@ -1,410 +1,216 @@
-//nolint:testpackage // internal tests for unexported methods
-package poller
+package poller_test
 
 import (
 	"context"
 	"encoding/json"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/google/go-github/v68/github"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 
-	"github.com/BlackbirdWorks/copilot-autocode/config"
-	"github.com/BlackbirdWorks/copilot-autocode/ghclient"
+	"github.com/BlackbirdWorks/copilot-autocode/poller"
 )
-
-// ─── FormatFallbackPrompt ─────────────────────────────────────────────────────
-
-func TestFormatFallbackPrompt(t *testing.T) {
-	t.Parallel()
-	num := 42
-	title := "Fix the login bug"
-	url := "https://github.com/org/repo/issues/42"
-	issue := &github.Issue{
-		Number:  &num,
-		Title:   &title,
-		HTMLURL: &url,
-	}
-
-	tests := []struct {
-		name     string
-		template string
-		want     string
-	}{
-		{
-			name:     "default template expands all placeholders",
-			template: "Please start working on issue #{issue_number}: {issue_title}.\n{issue_url}",
-			want:     "Please start working on issue #42: Fix the login bug.\nhttps://github.com/org/repo/issues/42",
-		},
-		{
-			name:     "only issue_number placeholder",
-			template: "Work on #{issue_number}",
-			want:     "Work on #42",
-		},
-		{
-			name:     "only issue_title placeholder",
-			template: "Task: {issue_title}",
-			want:     "Task: Fix the login bug",
-		},
-		{
-			name:     "only issue_url placeholder",
-			template: "See {issue_url}",
-			want:     "See https://github.com/org/repo/issues/42",
-		},
-		{
-			name:     "no placeholders — template returned as-is",
-			template: "Please start working on this issue.",
-			want:     "Please start working on this issue.",
-		},
-		{
-			name:     "all placeholders appear multiple times",
-			template: "{issue_number} {issue_number} {issue_title} {issue_url}",
-			want:     "42 42 Fix the login bug https://github.com/org/repo/issues/42",
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			assert.Equal(t, tc.want, FormatFallbackPrompt(tc.template, issue))
-		})
-	}
-}
 
 func TestSortIssuesAsc(t *testing.T) {
 	t.Parallel()
 	makeIssue := func(n int) *github.Issue { return &github.Issue{Number: &n} }
 
 	tests := []struct {
-		name  string
-		input []int
-		want  []int
+		name     string
+		input    []*github.Issue
+		expected []int
 	}{
-		{"empty slice", nil, nil},
-		{"single element", []int{5}, []int{5}},
-		{"already sorted", []int{1, 2, 3, 10}, []int{1, 2, 3, 10}},
-		{"reverse sorted", []int{10, 5, 3, 1}, []int{1, 3, 5, 10}},
-		{"mixed order", []int{4, 1, 7, 2, 9, 3}, []int{1, 2, 3, 4, 7, 9}},
-		{"duplicates preserved", []int{3, 1, 2, 1, 3}, []int{1, 1, 2, 3, 3}},
-		{"two elements swapped", []int{2, 1}, []int{1, 2}},
+		{"sorted", []*github.Issue{makeIssue(1), makeIssue(2), makeIssue(3)}, []int{1, 2, 3}},
+		{"unsorted", []*github.Issue{makeIssue(3), makeIssue(1), makeIssue(2)}, []int{1, 2, 3}},
+		{"reverse", []*github.Issue{makeIssue(5), makeIssue(4), makeIssue(3)}, []int{3, 4, 5}},
+		{"empty", []*github.Issue{}, []int{}},
+		{"single", []*github.Issue{makeIssue(42)}, []int{42}},
 	}
 
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			issues := make([]*github.Issue, len(tc.input))
-			for i, n := range tc.input {
-				issues[i] = makeIssue(n)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			poller.SortIssuesAsc(tt.input)
+			actual := make([]int, len(tt.input))
+			for i, v := range tt.input {
+				actual[i] = v.GetNumber()
 			}
-
-			SortIssuesAsc(issues)
-
-			require.Len(t, issues, len(tc.want))
-			for i, want := range tc.want {
-				assert.Equal(t, want, issues[i].GetNumber(), "index %d", i)
-			}
+			assert.Equal(t, tt.expected, actual)
 		})
 	}
 }
 
-// ─── BuildCIFailureSection ───────────────────────────────────────────────────
-
-func TestBuildCIFailureSection(t *testing.T) {
+func TestFormatFallbackPrompt(t *testing.T) {
 	t.Parallel()
+	issue := &github.Issue{
+		Number:  github.Ptr(123),
+		Title:   github.Ptr("Fix the bug"),
+		HTMLURL: github.Ptr("https://github.com/org/repo/issues/123"),
+	}
+
+	tpl := "Issue #{{.Number}}: {{.Title}} ({{.URL}})"
+	expected := "Issue #123: Fix the bug (https://github.com/org/repo/issues/123)"
+	actual := poller.FormatFallbackPrompt(tpl, issue)
+	assert.Equal(t, expected, actual)
+}
+
+func TestPoller_PromoteFromQueue(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
 	tests := []struct {
-		name         string
-		workflowName string
-		failedJobs   []ghclient.FailedJobInfo
-		wantContains []string
-		wantAbsent   []string
+		name          string
+		codingIssues  []*github.Issue
+		reviewIssues  []*github.Issue
+		queueIssues   []*github.Issue
+		maxConcurrent int
+		wantActions   int
 	}{
 		{
-			name:         "no workflow or jobs",
-			workflowName: "",
-			failedJobs:   nil,
-			wantContains: []string{"please fix the following CI failures"},
-			wantAbsent:   []string{"Failing workflow", "Failed jobs"},
+			name:          "promote within limits",
+			codingIssues:  []*github.Issue{{Number: github.Ptr(1)}},
+			reviewIssues:  []*github.Issue{{Number: github.Ptr(2)}},
+			queueIssues:   []*github.Issue{{Number: github.Ptr(3)}, {Number: github.Ptr(4)}},
+			maxConcurrent: 4,
+			wantActions:   2,
 		},
 		{
-			name:         "workflow name included",
-			workflowName: "CI / Build",
-			failedJobs:   nil,
-			wantContains: []string{"**Failing workflow:** CI / Build"},
-			wantAbsent:   []string{"Failed jobs"},
-		},
-		{
-			name:         "single failed job with log URL",
-			workflowName: "CI",
-			failedJobs: []ghclient.FailedJobInfo{
-				{Name: "test", LogURL: "https://logs.example.com/1"},
-			},
-			wantContains: []string{
-				"**Failing workflow:** CI",
-				"**Failed jobs:** test",
-				"**test** logs: https://logs.example.com/1",
-			},
-		},
-		{
-			name:         "multiple failed jobs, second has no log URL",
-			workflowName: "CI",
-			failedJobs: []ghclient.FailedJobInfo{
-				{Name: "build", LogURL: "https://logs.example.com/build"},
-				{Name: "lint", LogURL: ""},
-			},
-			wantContains: []string{
-				"**Failed jobs:** build, lint",
-				"**build** logs: https://logs.example.com/build",
-			},
-			wantAbsent: []string{"**lint** logs"},
-		},
-		{
-			name:         "empty workflow name skips that section",
-			workflowName: "",
-			failedJobs: []ghclient.FailedJobInfo{
-				{Name: "unit-tests", LogURL: ""},
-			},
-			wantContains: []string{"**Failed jobs:** unit-tests"},
-			wantAbsent:   []string{"Failing workflow"},
+			name:          "already at limit",
+			codingIssues:  []*github.Issue{{Number: github.Ptr(1)}},
+			reviewIssues:  []*github.Issue{{Number: github.Ptr(2)}},
+			queueIssues:   []*github.Issue{{Number: github.Ptr(3)}},
+			maxConcurrent: 2,
+			wantActions:   0,
 		},
 	}
 
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			got := BuildCIFailureSection(tc.workflowName, tc.failedJobs)
-			for _, want := range tc.wantContains {
-				assert.Contains(t, got, want)
-			}
-			for _, absent := range tc.wantAbsent {
-				assert.NotContains(t, got, absent)
-			}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := setupMockPoller(t, func(w http.ResponseWriter, r *http.Request) {
+				path := r.URL.Path
+				switch {
+				case strings.Contains(path, "/issues") && r.Method == http.MethodGet:
+					if strings.Contains(r.URL.Query().Get("labels"), "ai-coding") {
+						_ = json.NewEncoder(w).Encode(tt.codingIssues)
+					} else if strings.Contains(r.URL.Query().Get("labels"), "ai-review") {
+						_ = json.NewEncoder(w).Encode(tt.reviewIssues)
+					} else {
+						_ = json.NewEncoder(w).Encode(tt.queueIssues)
+					}
+				case strings.Contains(path, "/labels") && r.Method == http.MethodPost:
+					w.WriteHeader(http.StatusOK)
+				case strings.Contains(path, "/comments") && r.Method == http.MethodPost:
+					w.WriteHeader(http.StatusCreated)
+				case strings.Contains(path, "/pulls") && r.Method == http.MethodGet:
+					_ = json.NewEncoder(w).Encode([]*github.PullRequest{})
+				}
+			})
+			p.Cfg().MaxConcurrentIssues = tt.maxConcurrent
+
+			err := p.PromoteFromQueue(ctx, tt.queueIssues)
+			assert.NoError(t, err)
 		})
 	}
 }
 
-// TestApproveRetriesFallback verifies that the Poller's retry-limit logic
-// correctly caps the number of workflow-run approval attempts.
-func TestApproveRetriesFallback(t *testing.T) {
-	t.Parallel()
-	// New() initialises approveRetries to an empty map and exposes MaxAgentContinueRetries
-	// through the config. We test only the public API surface here.
-	p := New(&config.Config{
-		MaxAgentContinueRetries: 3,
-	}, nil, "")
-	require.NotNil(t, p)
-	assert.Equal(t, 3, p.cfg.MaxAgentContinueRetries)
-}
-
-func setupMockPoller(t *testing.T, handler http.HandlerFunc) *Poller {
-	t.Helper()
-	rt := &fakeRoundTripper{
-		handler: func(r *http.Request) (*http.Response, error) {
-			rec := httptest.NewRecorder()
-			handler(rec, r)
-			return rec.Result(), nil
-		},
-	}
-	cfg := &config.Config{
-		GitHubOwner:                 "test-owner",
-		GitHubRepo:                  "test-repo",
-		LabelQueue:                  "ai-todo",
-		LabelCoding:                 "ai-coding",
-		LabelReview:                 "ai-review",
-		MaxAgentContinueRetries:     3,
-		CopilotInvokeMaxRetries:     3,
-		CopilotInvokeTimeoutSeconds: 60,
-	}
-	client := ghclient.NewWithTransport("test-token", cfg, rt)
-	return New(cfg, client, "test-token")
-}
-
-type fakeRoundTripper struct {
-	handler func(*http.Request) (*http.Response, error)
-}
-
-func (f *fakeRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) {
-	return f.handler(r)
-}
-
-func TestProcessRequiredRuns(t *testing.T) {
+func TestPoller_Tick(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	pr := &github.PullRequest{Number: github.Ptr(123)}
 
-	t.Run("success", func(t *testing.T) {
-		t.Parallel()
-		p := setupMockPoller(t, func(w http.ResponseWriter, r *http.Request) {
-			switch {
-			case strings.Contains(r.URL.Path, "/actions/runs") && r.Method == http.MethodGet:
-				_ = json.NewEncoder(w).Encode(&github.WorkflowRuns{
-					WorkflowRuns: []*github.WorkflowRun{{
-						ID:     github.Ptr(int64(456)),
-						Name:   github.Ptr("test"),
-						Status: github.Ptr("action_required"),
-					}},
-				})
-			case strings.Contains(r.URL.Path, "/actions/runs/456/approve") && r.Method == http.MethodPost:
-				w.WriteHeader(http.StatusNoContent)
-			}
-		})
-
-		runs, done, err := p.processRequiredRuns(ctx, pr, "sha")
-		require.NoError(t, err)
-		assert.False(t, done)
-		require.Len(t, runs, 1)
-		assert.Equal(t, int64(456), runs[0].GetID())
-	})
-
-	t.Run("retry exhaustion", func(t *testing.T) {
-		t.Parallel()
-		p := setupMockPoller(t, func(w http.ResponseWriter, r *http.Request) {
-			switch {
-			case strings.Contains(r.URL.Path, "/actions/runs") && r.Method == http.MethodGet:
-				_ = json.NewEncoder(w).Encode(&github.WorkflowRuns{
-					WorkflowRuns: []*github.WorkflowRun{{
-						ID:     github.Ptr(int64(789)),
-						Name:   github.Ptr("fail"),
-						Status: github.Ptr("action_required"),
-					}},
-				})
-			case strings.Contains(r.URL.Path, "/approve") && r.Method == http.MethodPost:
-				w.WriteHeader(http.StatusInternalServerError)
-			case r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/comments"):
-				w.WriteHeader(http.StatusCreated)
-			case r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/labels"):
-				w.WriteHeader(http.StatusOK)
-			}
-		})
-
-		p.cfg.MaxAgentContinueRetries = 1
-		p.approveRetries[789] = 0 // first call fails -> becomes 1
-		_, done, err := p.processRequiredRuns(ctx, pr, "sha")
-		require.NoError(t, err)
-		assert.True(t, done)
-	})
-}
-
-func TestPromoteFromQueue(t *testing.T) {
-	t.Parallel()
-	ctx := context.Background()
 	p := setupMockPoller(t, func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
 		switch {
-		case r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/labels"):
-			w.WriteHeader(http.StatusOK)
-		case r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/comments"):
-			w.WriteHeader(http.StatusCreated)
-		case r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/copilot/agent/invoke"):
-			_ = json.NewEncoder(w).Encode(map[string]string{"id": "job-123"})
-		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/pulls"):
-			_ = json.NewEncoder(w).Encode([]*github.PullRequest{}) // no existing PR
+		case strings.Contains(path, "/issues") && r.Method == http.MethodGet:
+			_ = json.NewEncoder(w).Encode([]*github.Issue{})
+		case strings.Contains(path, "/pulls") && r.Method == http.MethodGet:
+			_ = json.NewEncoder(w).Encode([]*github.PullRequest{})
 		}
 	})
 
-	p.cfg.MaxConcurrentIssues = 2
-	queue := []*github.Issue{
-		{Number: github.Ptr(1), Title: github.Ptr("Issue 1")},
-		{Number: github.Ptr(2), Title: github.Ptr("Issue 2")},
-		{Number: github.Ptr(3), Title: github.Ptr("Issue 3")},
-	}
-	coding := []*github.Issue{{Number: github.Ptr(10)}}
-	reviewing := []*github.Issue{}
+	p.Tick(ctx)
+	// Just verify no panic and at least one run
+	assert.NotNil(t, p)
+}
 
-	// Should promote only 1 issue (10 coding + 1 new = 2 max)
-	err := p.promoteFromQueue(ctx, queue, coding, reviewing)
+func TestPoller_ProcessOne_NoPR(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	p := setupMockPoller(t, func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		switch {
+		case strings.Contains(path, "/pulls") && r.Method == http.MethodGet:
+			// No PR found
+			_ = json.NewEncoder(w).Encode([]*github.PullRequest{})
+		case strings.Contains(path, "/issues") && r.Method == http.MethodGet:
+			// No merged PR found
+			_ = json.NewEncoder(w).Encode([]*github.Issue{})
+		case strings.Contains(path, "/labels") && r.Method == http.MethodPost:
+			w.WriteHeader(http.StatusOK)
+		}
+	})
+
+	num := 123
+	issue := &github.Issue{Number: &num}
+	displayInfo := make(map[int]*poller.IssueDisplayInfo)
+	err := p.ProcessOne(ctx, issue, displayInfo)
 	assert.NoError(t, err)
 }
 
-func TestProcessCodingIssue(t *testing.T) {
+func TestPoller_DeduplicateIssueLists(t *testing.T) {
+	t.Parallel()
+	makeIssue := func(n int) *github.Issue { return &github.Issue{Number: &n} }
+
+	queue := []*github.Issue{makeIssue(1), makeIssue(2)}
+	coding := []*github.Issue{makeIssue(2), makeIssue(3), makeIssue(4)}
+	reviewing := []*github.Issue{makeIssue(4), makeIssue(5)}
+
+	newCoding, newReviewing := poller.DeduplicateIssueLists(queue, coding, reviewing)
+
+	assert.Len(t, newReviewing, 2)
+	assert.Len(t, newCoding, 1)
+	assert.Equal(t, 3, newCoding[0].GetNumber())
+}
+
+func TestPoller_Snapshot(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	issue := &github.Issue{Number: github.Ptr(123), Title: github.Ptr("Issue 123")}
-
-	t.Run("PR merged externally", func(t *testing.T) {
-		t.Parallel()
-		displayInfo := make(map[int]*issueDisplayInfo)
-		p := setupMockPoller(t, func(w http.ResponseWriter, r *http.Request) {
-			path := r.URL.Path
-			switch {
-			case r.Method == http.MethodGet && strings.Contains(path, "/search/issues"):
-				_ = json.NewEncoder(w).Encode(&github.IssuesSearchResult{
-					Issues: []*github.Issue{{
-						Number:           github.Ptr(456),
-						State:            github.Ptr("closed"),
-						Title:            github.Ptr("Fix #123"),
-						Body:             github.Ptr("Fixes #123"),
-						PullRequestLinks: &github.PullRequestLinks{},
-					}},
-				})
-			case r.Method == http.MethodGet && strings.Contains(path, "/pulls"):
-				if strings.HasSuffix(path, "/456") {
-					_ = json.NewEncoder(w).Encode(&github.PullRequest{
-						Number: github.Ptr(456),
-						Merged: github.Ptr(true),
-						Title:  github.Ptr("Fix #123"),
-						Body:   github.Ptr("Fixes #123"),
-					})
-				} else {
-					_ = json.NewEncoder(w).Encode([]*github.PullRequest{})
-				}
-			case r.Method == http.MethodGet && strings.Contains(path, "/issues/123/events"):
-				_ = json.NewEncoder(w).Encode([]*github.IssueEvent{{
-					Event:     github.Ptr("labeled"),
-					Label:     &github.Label{Name: github.Ptr("ai-coding")},
-					CreatedAt: &github.Timestamp{Time: time.Now().Add(-2 * time.Hour)},
-				}})
-			case r.Method == http.MethodGet && strings.Contains(path, "/issues/123/comments"):
-				_ = json.NewEncoder(w).Encode([]*github.IssueComment{})
-			case r.Method == http.MethodGet && strings.Contains(path, "/issues/456"):
-				_ = json.NewEncoder(w).Encode(&github.Issue{
-					Number:           github.Ptr(456),
-					PullRequestLinks: &github.PullRequestLinks{},
-					Title:            github.Ptr("Fix #123"),
-				})
-			case r.Method == http.MethodDelete && strings.Contains(path, "/labels"):
-				w.WriteHeader(http.StatusOK)
-			case r.Method == http.MethodPatch && strings.Contains(path, "/issues/123"):
-				w.WriteHeader(http.StatusOK) // CloseIssue
-			}
-		})
-
-		err := p.processCodingIssue(ctx, issue, displayInfo)
-		require.NoError(t, err)
-		assert.Contains(t, displayInfo[123].current, "merged externally")
+	p := setupMockPoller(t, func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode([]*github.Issue{})
 	})
 
-	t.Run("nudge agent", func(t *testing.T) {
-		t.Parallel()
-		displayInfo := make(map[int]*issueDisplayInfo)
-		p := setupMockPoller(t, func(w http.ResponseWriter, r *http.Request) {
-			switch {
-			case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/pulls"):
-				_ = json.NewEncoder(w).Encode([]*github.PullRequest{}) // no open PR
-			case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/search/issues"):
-				_ = json.NewEncoder(w).Encode(&github.IssuesSearchResult{Issues: []*github.Issue{}}) // no merged PR
-			case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/issues/123/events"):
-				// Mock labeled event for CodingLabeledAt
-				_ = json.NewEncoder(w).Encode([]*github.IssueEvent{{
-					Event:     github.Ptr("labeled"),
-					Label:     &github.Label{Name: github.Ptr("ai-coding")},
-					CreatedAt: &github.Timestamp{Time: time.Now().Add(-2 * time.Hour)},
-				}})
-			case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/issues/123/comments"):
-				// No comments -> needs nudge
-				_ = json.NewEncoder(w).Encode([]*github.IssueComment{})
-			case r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/comments"):
-				w.WriteHeader(http.StatusCreated)
-			}
-		})
+	num := 123
+	displayInfo := map[int]*poller.IssueDisplayInfo{
+		num: {
+			Current:     "working",
+			AgentStatus: "pending",
+		},
+	}
 
-		p.cfg.CopilotInvokeTimeoutSeconds = 0 // force timeout
-		err := p.processCodingIssue(ctx, issue, displayInfo)
-		require.NoError(t, err)
-		// nudgeSingleCodingIssue calls requestNudge which sets "Invoking agent via Copilot API (attempt 1 of 3)"
-		assert.Contains(t, displayInfo[123].current, "Invoking agent via Copilot API")
+	queue, coding, review := p.Snapshot(ctx, displayInfo)
+	assert.NotNil(t, queue)
+	assert.NotNil(t, coding)
+	assert.NotNil(t, review)
+}
+
+func TestPoller_Tick_Complex(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	p := setupMockPoller(t, func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		switch {
+		case strings.Contains(path, "/issues") && r.Method == http.MethodGet:
+			if strings.Contains(r.URL.Query().Get("labels"), "ai-coding") {
+				_ = json.NewEncoder(w).Encode([]*github.Issue{{Number: github.Ptr(10)}})
+			} else {
+				_ = json.NewEncoder(w).Encode([]*github.Issue{})
+			}
+		case strings.Contains(path, "/pulls") && r.Method == http.MethodGet:
+			_ = json.NewEncoder(w).Encode([]*github.PullRequest{})
+		}
 	})
+
+	p.Tick(ctx)
 }

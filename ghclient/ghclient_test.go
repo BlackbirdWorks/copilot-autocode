@@ -1,7 +1,6 @@
 package ghclient_test
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -118,7 +117,7 @@ func TestInvokeCopilotAgent(t *testing.T) {
 			})
 
 			jobID, err := c.InvokeAgentAt(
-				context.Background(),
+				t.Context(),
 				"https://api.githubcopilot.com/agents/swe/v1/jobs/test-owner/test-repo",
 				tc.prompt, tc.issueTitle, tc.issueNum, tc.issueURL,
 			)
@@ -141,14 +140,29 @@ func TestInvokeCopilotAgent(t *testing.T) {
 // TestUpdatePRBranch verifies updating the PR branch via native API.
 func TestUpdatePRBranch(t *testing.T) {
 	t.Parallel()
-	c := setupMockGitHubAPI(t, func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal(t, http.MethodPut, r.Method)
-		assert.Contains(t, r.URL.Path, "/update-branch")
-		w.WriteHeader(http.StatusAccepted)
-		_, _ = w.Write([]byte(`{"message": "job scheduled on GitHub side; try again later"}`))
-	})
-	err := c.UpdatePRBranch(context.Background(), 123)
-	require.NoError(t, err)
+	tests := []struct {
+		name    string
+		status  int
+		wantErr bool
+	}{
+		{"success", http.StatusAccepted, false},
+		{"error", http.StatusInternalServerError, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			c := setupMockGitHubAPI(t, func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tc.status)
+				_ = json.NewEncoder(w).Encode(map[string]string{"message": "msg"})
+			})
+			err := c.UpdatePRBranch(t.Context(), 123)
+			if tc.wantErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
 }
 
 // TestTimeAgo verifies that TimeAgo produces the correct relative-time label
@@ -201,35 +215,9 @@ func setupMockAPI(t *testing.T, handler func(*http.Request) (*http.Response, err
 	return ghclient.NewWithTransport("test-token", cfg, rt)
 }
 
-type fakeRoundTripper struct {
-	handler func(*http.Request) (*http.Response, error)
-}
+// fakeRoundTripper is now in test_utils_test.go
 
-func (f *fakeRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) {
-	return f.handler(r)
-}
-
-// setupMockGitHubAPI creates a Client backed by a mock RoundTripper.
-func setupMockGitHubAPI(t *testing.T, handler http.HandlerFunc) *ghclient.Client {
-	t.Helper()
-	rt := &fakeRoundTripper{
-		handler: func(r *http.Request) (*http.Response, error) {
-			rec := httptest.NewRecorder()
-			handler(rec, r)
-			resp := rec.Result()
-			// Mocking github.Client requires a BaseURL. The RoundTripper itself
-			// doesn't care about the host if we handle it here, but go-github
-			// will construct URLs. We can just return the result.
-			return resp, nil
-		},
-	}
-	cfg := &config.Config{
-		GitHubOwner: "test-owner",
-		GitHubRepo:  "test-repo",
-	}
-	c := ghclient.NewWithTransport("test-token", cfg, rt)
-	return c
-}
+// setupMockGitHubAPI is now in test_utils_test.go
 
 // TestAnyWorkflowRunActive verifies that waiting/action_required states
 // do not trigger a 'true' return (preventing deadlocks).
@@ -280,7 +268,7 @@ func TestAnyWorkflowRunActive(t *testing.T) {
 				_ = json.NewEncoder(w).Encode(resp)
 			})
 
-			active, err := c.AnyWorkflowRunActive(context.Background(), "dummy-sha")
+			active, err := c.AnyWorkflowRunActive(t.Context(), "dummy-sha")
 			require.NoError(t, err)
 			assert.Equal(t, tc.wantActive, active)
 		})
@@ -376,7 +364,7 @@ func TestAllRunsSucceeded(t *testing.T) {
 				_ = json.NewEncoder(w).Encode(resp)
 			})
 
-			success, fail, err := c.AllRunsSucceeded(context.Background(), "dummy-sha")
+			success, fail, err := c.AllRunsSucceeded(t.Context(), "dummy-sha")
 			require.NoError(t, err)
 			assert.Equal(t, tc.wantSuccess, success)
 			assert.Equal(t, tc.wantAnyFail, fail)
@@ -451,7 +439,7 @@ func TestListActionRequiredRuns(t *testing.T) {
 				_ = json.NewEncoder(w).Encode(resp)
 			})
 
-			got, err := c.ListActionRequiredRuns(context.Background(), "dummy-sha")
+			got, err := c.ListActionRequiredRuns(t.Context(), "dummy-sha")
 			require.NoError(t, err)
 			assert.Len(t, got, tc.wantCount)
 		})
@@ -514,7 +502,7 @@ func TestListPendingDeploymentRuns(t *testing.T) {
 				_ = json.NewEncoder(w).Encode(resp)
 			})
 
-			got, err := c.ListPendingDeploymentRuns(context.Background(), "dummy-sha")
+			got, err := c.ListPendingDeploymentRuns(t.Context(), "dummy-sha")
 			require.NoError(t, err)
 			assert.Len(t, got, tc.wantCount)
 		})
@@ -580,7 +568,7 @@ func TestApprovePendingDeployments(t *testing.T) {
 				_ = json.NewEncoder(w).Encode([]map[string]any{})
 			})
 
-			approved, err := c.ApprovePendingDeployments(context.Background(), runID)
+			approved, err := c.ApprovePendingDeployments(t.Context(), runID)
 			require.NoError(t, err)
 			assert.Equal(t, tc.wantApproved, approved)
 			assert.Equal(t, tc.wantPostBody, gotPostBody)
@@ -666,7 +654,7 @@ func TestHasActiveCopilotRun(t *testing.T) {
 				_ = json.NewEncoder(w).Encode(resp)
 			})
 
-			active, err := c.HasActiveCopilotRun(context.Background())
+			active, err := c.HasActiveCopilotRun(t.Context())
 			require.NoError(t, err)
 			assert.Equal(t, tc.wantActive, active)
 		})
@@ -774,7 +762,7 @@ func TestGetCopilotJobStatus(t *testing.T) {
 			client := ghclient.NewTestClient("test-owner", "test-repo", "test-token")
 			endpoint := srv.URL + "/agents/swe/v1/jobs/test-owner/test-repo/" + tc.jobID
 
-			status, err := client.GetJobStatusAt(context.Background(), endpoint, tc.jobID)
+			status, err := client.GetJobStatusAt(t.Context(), endpoint, tc.jobID)
 			if tc.wantErr {
 				require.Error(t, err)
 			} else {
@@ -848,7 +836,7 @@ func TestLatestCopilotJobID(t *testing.T) {
 				_ = json.NewEncoder(w).Encode(tc.comments)
 			})
 
-			jobID, err := c.LatestCopilotJobID(context.Background(), 1)
+			jobID, err := c.LatestCopilotJobID(t.Context(), 1)
 			require.NoError(t, err)
 			assert.Equal(t, tc.wantJobID, jobID)
 		})
@@ -877,7 +865,7 @@ func TestSwapLabel(t *testing.T) {
 				w.WriteHeader(http.StatusNoContent)
 			}
 		})
-		err := c.SwapLabel(context.Background(), issueNum, oldLabel, newLabel)
+		err := c.SwapLabel(t.Context(), issueNum, oldLabel, newLabel)
 		require.NoError(t, err)
 		assert.Equal(t, 2, calls)
 	})
@@ -891,7 +879,7 @@ func TestSwapLabel(t *testing.T) {
 				w.WriteHeader(http.StatusInternalServerError)
 			}
 		})
-		err := c.SwapLabel(context.Background(), issueNum, oldLabel, newLabel)
+		err := c.SwapLabel(t.Context(), issueNum, oldLabel, newLabel)
 		require.Error(t, err)
 		assert.Equal(t, 1, calls)
 	})
@@ -908,7 +896,7 @@ func TestCloseIssue(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 		_ = json.NewEncoder(w).Encode(&github.Issue{Number: github.Ptr(123), State: github.Ptr("closed")})
 	})
-	err := c.CloseIssue(context.Background(), 123)
+	err := c.CloseIssue(t.Context(), 123)
 	require.NoError(t, err)
 }
 
@@ -932,7 +920,7 @@ func TestOpenPRForIssue(t *testing.T) {
 				w.WriteHeader(http.StatusOK) // ensureTwoWayLink
 			}
 		})
-		pr, err := c.OpenPRForIssue(context.Background(), issue)
+		pr, err := c.OpenPRForIssue(t.Context(), issue)
 		require.NoError(t, err)
 		require.NotNil(t, pr)
 		assert.Equal(t, 456, pr.GetNumber())
@@ -976,7 +964,7 @@ func TestOpenPRForIssue(t *testing.T) {
 				w.WriteHeader(http.StatusOK)
 			}
 		})
-		pr, err := c.OpenPRForIssue(context.Background(), issue)
+		pr, err := c.OpenPRForIssue(t.Context(), issue)
 		require.NoError(t, err)
 		require.NotNil(t, pr)
 		assert.Equal(t, 202, pr.GetNumber())
@@ -998,7 +986,7 @@ func TestOpenPRForIssue(t *testing.T) {
 				w.WriteHeader(http.StatusOK)
 			}
 		})
-		pr, err := c.OpenPRForIssue(context.Background(), issue)
+		pr, err := c.OpenPRForIssue(t.Context(), issue)
 		require.NoError(t, err)
 		require.NotNil(t, pr)
 		assert.Equal(t, 303, pr.GetNumber())
@@ -1030,9 +1018,631 @@ func TestOpenPRForIssue(t *testing.T) {
 				w.WriteHeader(http.StatusOK)
 			}
 		})
-		pr, err := c.OpenPRForIssue(context.Background(), issue)
+		pr, err := c.OpenPRForIssue(t.Context(), issue)
 		require.NoError(t, err)
 		require.NotNil(t, pr)
 		assert.Equal(t, 505, pr.GetNumber())
 	})
+
+	t.Run("marker comment", func(t *testing.T) {
+		t.Parallel()
+		c := setupMockGitHubAPI(t, func(w http.ResponseWriter, r *http.Request) {
+			if strings.Contains(r.URL.Path, "/comments") {
+				_ = json.NewEncoder(w).Encode([]*github.IssueComment{{Body: github.Ptr("<!-- copilot-autocode:pr-link:505 -->")}})
+			} else if strings.Contains(r.URL.Path, "/pulls/505") {
+				_ = json.NewEncoder(w).Encode(&github.PullRequest{Number: github.Ptr(505), State: github.Ptr("open")})
+			} else if r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/labels") {
+				w.WriteHeader(http.StatusOK)
+			}
+		})
+		pr, err := c.OpenPRForIssue(t.Context(), issue)
+		require.NoError(t, err)
+		assert.Equal(t, 505, pr.GetNumber())
+	})
+
+	t.Run("job id discovery", func(t *testing.T) {
+		t.Parallel()
+		c := setupMockGitHubAPI(t, func(w http.ResponseWriter, r *http.Request) {
+			if strings.Contains(r.URL.Path, "/comments") {
+				_ = json.NewEncoder(w).Encode([]*github.IssueComment{{Body: github.Ptr("<!-- copilot-autocode:job-id:job123 -->")}})
+			} else if strings.Contains(r.URL.Path, "/search/issues") {
+				_ = json.NewEncoder(w).Encode(&github.IssuesSearchResult{Issues: []*github.Issue{{Number: github.Ptr(505), PullRequestLinks: &github.PullRequestLinks{URL: github.Ptr("url")}}}})
+			} else if strings.Contains(r.URL.Path, "/pulls/505") {
+				_ = json.NewEncoder(w).Encode(&github.PullRequest{Number: github.Ptr(505), State: github.Ptr("open")})
+			} else if r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/labels") {
+				w.WriteHeader(http.StatusOK)
+			}
+		})
+		pr, err := c.OpenPRForIssue(t.Context(), issue)
+		require.NoError(t, err)
+		assert.Equal(t, 505, pr.GetNumber())
+	})
+
+	t.Run("match by body", func(t *testing.T) {
+		t.Parallel()
+		c := setupMockGitHubAPI(t, func(w http.ResponseWriter, r *http.Request) {
+			if strings.Contains(r.URL.Path, "/pulls") && r.Method == http.MethodGet {
+				_ = json.NewEncoder(w).Encode([]*github.PullRequest{{
+					Number: github.Ptr(505),
+					Body:   github.Ptr("Fixes #123"),
+					State:  github.Ptr("open"),
+				}})
+			} else if r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/labels") {
+				w.WriteHeader(http.StatusOK)
+			}
+		})
+		pr, err := c.OpenPRForIssue(t.Context(), issue)
+		require.NoError(t, err)
+		assert.Equal(t, 505, pr.GetNumber())
+	})
+
+	t.Run("match by branch", func(t *testing.T) {
+		t.Parallel()
+		c := setupMockGitHubAPI(t, func(w http.ResponseWriter, r *http.Request) {
+			if strings.Contains(r.URL.Path, "/pulls") && r.Method == http.MethodGet {
+				_ = json.NewEncoder(w).Encode([]*github.PullRequest{{
+					Number: github.Ptr(505),
+					Head:   &github.PullRequestBranch{Ref: github.Ptr("issue-123")},
+					State:  github.Ptr("open"),
+				}})
+			} else if r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/labels") {
+				w.WriteHeader(http.StatusOK)
+			}
+		})
+		pr, err := c.OpenPRForIssue(t.Context(), issue)
+		require.NoError(t, err)
+		assert.Equal(t, 505, pr.GetNumber())
+	})
+
+	t.Run("search multiple results", func(t *testing.T) {
+		t.Parallel()
+		c := setupMockGitHubAPI(t, func(w http.ResponseWriter, r *http.Request) {
+			if strings.Contains(r.URL.Path, "/search/issues") {
+				_ = json.NewEncoder(w).Encode(&github.IssuesSearchResult{
+					Issues: []*github.Issue{
+						{Number: github.Ptr(999), PullRequestLinks: &github.PullRequestLinks{URL: github.Ptr("url")}},
+						{Number: github.Ptr(505), PullRequestLinks: &github.PullRequestLinks{URL: github.Ptr("url")}},
+					},
+				})
+			} else if strings.Contains(r.URL.Path, "/pulls/999") {
+				_ = json.NewEncoder(w).Encode(&github.PullRequest{Number: github.Ptr(999), Title: github.Ptr("No match")})
+			} else if strings.Contains(r.URL.Path, "/pulls/505") {
+				_ = json.NewEncoder(w).Encode(&github.PullRequest{Number: github.Ptr(505), Title: github.Ptr(fmt.Sprintf("Fix #%d", issueNum)), State: github.Ptr("open")})
+			} else if r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/labels") {
+				w.WriteHeader(http.StatusOK)
+			}
+		})
+		pr, err := c.OpenPRForIssue(t.Context(), issue)
+		require.NoError(t, err)
+		assert.Equal(t, 505, pr.GetNumber())
+	})
+
+	t.Run("timeline other events", func(t *testing.T) {
+		t.Parallel()
+		c := setupMockGitHubAPI(t, func(w http.ResponseWriter, r *http.Request) {
+			if strings.Contains(r.URL.Path, "/timeline") {
+				resp := []map[string]interface{}{
+					{"event": "commented"},
+					{
+						"event":  "cross-referenced",
+						"source": map[string]interface{}{"issue": map[string]interface{}{"number": 505, "pull_request": map[string]interface{}{"url": "url"}}},
+					},
+				}
+				_ = json.NewEncoder(w).Encode(resp)
+			} else if strings.Contains(r.URL.Path, "/pulls/505") {
+				_ = json.NewEncoder(w).Encode(&github.PullRequest{Number: github.Ptr(505), State: github.Ptr("open")})
+			} else if r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/labels") {
+				w.WriteHeader(http.StatusOK)
+			}
+		})
+		pr, err := c.OpenPRForIssue(t.Context(), issue)
+		require.NoError(t, err)
+		assert.Equal(t, 505, pr.GetNumber())
+	})
+}
+
+func TestMergedPRForIssue(t *testing.T) {
+	t.Parallel()
+	issueNum := 123
+	issue := &github.Issue{Number: github.Ptr(issueNum)}
+
+	tests := []struct {
+		name        string
+		mockHandler func(w http.ResponseWriter, r *http.Request)
+		wantPRNum   int
+		wantErr     bool
+	}{
+		{
+			name: "found via search with title match",
+			mockHandler: func(w http.ResponseWriter, r *http.Request) {
+				if strings.Contains(r.URL.Path, "/search/issues") {
+					_ = json.NewEncoder(w).Encode(&github.IssuesSearchResult{
+						Issues: []*github.Issue{{
+							Number:           github.Ptr(456),
+							PullRequestLinks: &github.PullRequestLinks{URL: github.Ptr("url")},
+						}},
+					})
+				} else if strings.Contains(r.URL.Path, "/pulls/456") {
+					_ = json.NewEncoder(w).Encode(&github.PullRequest{
+						Number: github.Ptr(456),
+						Title:  github.Ptr(fmt.Sprintf("Fix #%d", issueNum)),
+						Merged: github.Ptr(true),
+					})
+				}
+			},
+			wantPRNum: 456,
+		},
+		{
+			name: "found via search with body match",
+			mockHandler: func(w http.ResponseWriter, r *http.Request) {
+				if strings.Contains(r.URL.Path, "/search/issues") {
+					_ = json.NewEncoder(w).Encode(&github.IssuesSearchResult{
+						Issues: []*github.Issue{{
+							Number:           github.Ptr(456),
+							PullRequestLinks: &github.PullRequestLinks{URL: github.Ptr("url")},
+						}},
+					})
+				} else if strings.Contains(r.URL.Path, "/pulls/456") {
+					_ = json.NewEncoder(w).Encode(&github.PullRequest{
+						Number: github.Ptr(456),
+						Body:   github.Ptr(fmt.Sprintf("resolves #%d", issueNum)),
+						Merged: github.Ptr(true),
+					})
+				}
+			},
+			wantPRNum: 456,
+		},
+		{
+			name: "found via listing closed prs",
+			mockHandler: func(w http.ResponseWriter, r *http.Request) {
+				if strings.Contains(r.URL.Path, "/search/issues") {
+					_ = json.NewEncoder(w).Encode(&github.IssuesSearchResult{Total: github.Ptr(0)})
+				} else if r.URL.Path == "/repos/test-owner/test-repo/pulls" {
+					_ = json.NewEncoder(w).Encode([]*github.PullRequest{{
+						Number: github.Ptr(789),
+						Title:  github.Ptr(fmt.Sprintf("Fix #%d", issueNum)),
+						Merged: github.Ptr(true),
+						State:  github.Ptr("closed"),
+					}})
+				}
+			},
+			wantPRNum: 789,
+		},
+		{
+			name: "not found",
+			mockHandler: func(w http.ResponseWriter, r *http.Request) {
+				if strings.Contains(r.URL.Path, "/search/issues") {
+					_ = json.NewEncoder(w).Encode(&github.IssuesSearchResult{Total: github.Ptr(0)})
+				} else if r.URL.Path == "/repos/test-owner/test-repo/pulls" {
+					_ = json.NewEncoder(w).Encode([]*github.PullRequest{})
+				}
+			},
+			wantPRNum: 0,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			c := setupMockGitHubAPI(t, tc.mockHandler)
+			pr, err := c.MergedPRForIssue(t.Context(), issue)
+			if tc.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			if tc.wantPRNum != 0 {
+				require.NotNil(t, pr)
+				assert.Equal(t, tc.wantPRNum, pr.GetNumber())
+			} else {
+				assert.Nil(t, pr)
+			}
+		})
+	}
+}
+
+func TestMarkPRReady(t *testing.T) {
+	t.Parallel()
+	c := setupMockGitHubAPI(t, func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodPost, r.Method)
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"markPullRequestReadyForReview": map[string]any{"pullRequest": map[string]any{"id": "node123"}}}})
+	})
+	pr := &github.PullRequest{Number: github.Ptr(123), NodeID: github.Ptr("node123")}
+	err := c.MarkPRReady(t.Context(), pr)
+	require.NoError(t, err)
+}
+
+func TestPRIsUpToDateWithBase(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		status string
+		behind int
+		want   bool
+	}{
+		{"ahead", "ahead", 0, true},
+		{"behind", "behind", 1, false},
+		{"identical", "identical", 0, true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			c := setupMockGitHubAPI(t, func(w http.ResponseWriter, r *http.Request) {
+				_ = json.NewEncoder(w).Encode(&github.CommitsComparison{
+					Status:   github.Ptr(tc.status),
+					BehindBy: github.Ptr(tc.behind),
+				})
+			})
+			pr := &github.PullRequest{
+				Number: github.Ptr(123),
+				Base:   &github.PullRequestBranch{Ref: github.Ptr("main")},
+				Head:   &github.PullRequestBranch{Ref: github.Ptr("feat")},
+			}
+			got, err := c.PRIsUpToDateWithBase(t.Context(), pr)
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
+func TestCodingLabeledAt(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+	c := setupMockGitHubAPI(t, func(w http.ResponseWriter, r *http.Request) {
+		events := []*github.IssueEvent{
+			{
+				Event:     github.Ptr("labeled"),
+				Label:     &github.Label{Name: github.Ptr("ai-coding")},
+				CreatedAt: &github.Timestamp{Time: now},
+			},
+		}
+		_ = json.NewEncoder(w).Encode(events)
+	})
+	got, err := c.CodingLabeledAt(t.Context(), 123, "ai-coding")
+	require.NoError(t, err)
+	assert.WithinDuration(t, now, got, time.Second)
+}
+
+func TestCountNudgesSince(t *testing.T) {
+	t.Parallel()
+	c := setupMockGitHubAPI(t, func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode([]*github.IssueComment{
+			{Body: github.Ptr("<!-- copilot-autocode:nudge -->"), CreatedAt: &github.Timestamp{Time: time.Now()}},
+		})
+	})
+	got, err := c.CountNudgesSince(t.Context(), 123, time.Now().Add(-1*time.Hour))
+	require.NoError(t, err)
+	assert.Equal(t, 1, got)
+}
+
+func TestLastNudgeAt(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+	c := setupMockGitHubAPI(t, func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode([]*github.IssueComment{
+			{Body: github.Ptr("<!-- copilot-autocode:nudge -->"), CreatedAt: &github.Timestamp{Time: now}},
+		})
+	})
+	got, err := c.LastNudgeAt(t.Context(), 123)
+	require.NoError(t, err)
+	assert.WithinDuration(t, now, got, time.Second)
+}
+
+func TestDeleteCommentContaining(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		body    string
+		needle  string
+		wantErr bool
+	}{
+		{"found and deleted", "target marker", "target", false},
+		{"not found", "other comment", "target", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			c := setupMockGitHubAPI(t, func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodGet {
+					_ = json.NewEncoder(w).Encode([]*github.IssueComment{{ID: github.Ptr(int64(10)), Body: github.Ptr(tc.body)}})
+				} else if r.Method == http.MethodDelete {
+					w.WriteHeader(http.StatusNoContent)
+				}
+			})
+			err := c.DeleteCommentContaining(t.Context(), 123, tc.needle)
+			if tc.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestSHAMarker(t *testing.T) {
+	t.Parallel()
+	got := ghclient.SHAMarker("test", "abc123")
+	assert.Contains(t, got, "copilot-autocode:test:abc123")
+}
+
+func TestHasReviewContaining(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+	tests := []struct {
+		name    string
+		body    string
+		needle  string
+		found   bool
+		wantErr bool
+	}{
+		{"found", "hello world", "world", true, false},
+		{"not found", "hello world", "foo", false, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			c := setupMockGitHubAPI(t, func(w http.ResponseWriter, r *http.Request) {
+				reviews := []*github.PullRequestReview{{Body: github.Ptr(tc.body), SubmittedAt: &github.Timestamp{Time: now}}}
+				_ = json.NewEncoder(w).Encode(reviews)
+			})
+			found, at, err := c.HasReviewContaining(t.Context(), 123, tc.needle)
+			if tc.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.found, found)
+			if tc.found {
+				assert.WithinDuration(t, now, at, time.Second)
+			}
+		})
+	}
+}
+
+func TestHasCommentContaining(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+	c := setupMockGitHubAPI(t, func(w http.ResponseWriter, r *http.Request) {
+		comments := []*github.IssueComment{
+			{
+				Body:      github.Ptr("found comment"),
+				CreatedAt: &github.Timestamp{Time: now},
+			},
+		}
+		_ = json.NewEncoder(w).Encode(comments)
+	})
+	found, at, err := c.HasCommentContaining(t.Context(), 123, "found comment")
+	require.NoError(t, err)
+	assert.True(t, found)
+	assert.WithinDuration(t, now, at, time.Second)
+}
+
+func TestGetCopilotJobStatus_Full(t *testing.T) {
+	t.Parallel()
+	c := setupMockGitHubAPI(t, func(w http.ResponseWriter, r *http.Request) {
+		assert.Contains(t, r.URL.Path, "/jobs/test-owner/test-repo/job-123")
+		_ = json.NewEncoder(w).Encode(&ghclient.CopilotJobStatus{Status: "completed"})
+	})
+	status, err := c.GetCopilotJobStatus(t.Context(), "job-123")
+	require.NoError(t, err)
+	assert.Equal(t, "completed", status.Status)
+}
+
+func TestInvokeCopilotAgent_Full(t *testing.T) {
+	t.Parallel()
+	c := setupMockGitHubAPI(t, func(w http.ResponseWriter, r *http.Request) {
+		assert.Contains(t, r.URL.Path, "/jobs/test-owner/test-repo")
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]string{"id": "job-abc"})
+	})
+	jobID, err := c.InvokeCopilotAgent(t.Context(), "fix bug", "Fix bug", 1, "url")
+	require.NoError(t, err)
+	assert.Equal(t, "job-abc", jobID)
+}
+
+func TestCountCIFixPromptsSent(t *testing.T) {
+	t.Parallel()
+	c := setupMockGitHubAPI(t, func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode([]*github.IssueComment{
+			{Body: github.Ptr("<!-- copilot-autocode:ci-fix -->")},
+		})
+	})
+	got, err := c.CountCIFixPromptsSent(t.Context(), 123)
+	require.NoError(t, err)
+	assert.Equal(t, 1, got)
+}
+
+func TestLastSuccessfulLocalResolutionAt(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+	c := setupMockGitHubAPI(t, func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode([]*github.IssueComment{
+			{
+				Body:      github.Ptr("<!-- copilot-autocode:local-resolution --> success"),
+				CreatedAt: &github.Timestamp{Time: now},
+			},
+		})
+	})
+	got, err := c.LastSuccessfulLocalResolutionAt(t.Context(), 123)
+	require.NoError(t, err)
+	assert.WithinDuration(t, now, got, time.Second)
+}
+
+func TestRerunWorkflow(t *testing.T) {
+	t.Parallel()
+	c := setupMockGitHubAPI(t, func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodPost, r.Method)
+		assert.Contains(t, r.URL.Path, "/rerun")
+		w.WriteHeader(http.StatusCreated)
+	})
+	err := c.RerunWorkflow(t.Context(), 12345)
+	require.NoError(t, err)
+}
+
+func TestApproveWorkflowRun(t *testing.T) {
+	t.Parallel()
+	c := setupMockGitHubAPI(t, func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodPost, r.Method)
+		assert.Contains(t, r.URL.Path, "/approve")
+		w.WriteHeader(http.StatusNoContent)
+	})
+	err := c.ApproveWorkflowRun(t.Context(), 12345)
+	require.NoError(t, err)
+}
+
+func TestFailedRunDetails(t *testing.T) {
+	t.Parallel()
+	c := setupMockGitHubAPI(t, func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/actions/runs") && !strings.Contains(r.URL.Path, "/jobs") {
+			_ = json.NewEncoder(w).Encode(&github.WorkflowRuns{
+				WorkflowRuns: []*github.WorkflowRun{{ID: github.Ptr(int64(101)), Name: github.Ptr("test-workflow"), Conclusion: github.Ptr("failure")}},
+			})
+		} else if strings.Contains(r.URL.Path, "/jobs") {
+			_ = json.NewEncoder(w).Encode(&github.Jobs{
+				Jobs: []*github.WorkflowJob{
+					{Name: github.Ptr("test"), Conclusion: github.Ptr("failure"), HTMLURL: github.Ptr("url")},
+				},
+			})
+		}
+	})
+	workflow, details, err := c.FailedRunDetails(t.Context(), "sha123")
+	require.NoError(t, err)
+	assert.Equal(t, "test-workflow", workflow)
+	require.Len(t, details, 1)
+	assert.Equal(t, "test", details[0].Name)
+}
+
+func TestLatestFailedRunConclusion(t *testing.T) {
+	t.Parallel()
+	c := setupMockGitHubAPI(t, func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(&github.WorkflowRuns{
+			WorkflowRuns: []*github.WorkflowRun{
+				{Conclusion: github.Ptr("timed_out"), UpdatedAt: &github.Timestamp{Time: time.Now()}, Status: github.Ptr("completed")},
+			},
+		})
+	})
+	conclusion, _, err := c.LatestFailedRunConclusion(t.Context(), "sha")
+	require.NoError(t, err)
+	assert.Equal(t, "timed_out", conclusion)
+}
+
+func TestEnsureLabelsExist(t *testing.T) {
+	t.Parallel()
+	c := setupMockGitHubAPI(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			_ = json.NewEncoder(w).Encode([]*github.Label{{Name: github.Ptr("bug")}})
+		} else if r.Method == http.MethodPost {
+			w.WriteHeader(http.StatusCreated)
+		}
+	})
+	err := c.EnsureLabelsExist(t.Context())
+	require.NoError(t, err)
+}
+
+func TestContinueComments(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+	c := setupMockGitHubAPI(t, func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode([]*github.IssueComment{
+			{Body: github.Ptr("<!-- copilot-autocode:agent-continue -->"), CreatedAt: &github.Timestamp{Time: now}},
+			{Body: github.Ptr("<!-- copilot-autocode:merge-conflict-continue -->"), CreatedAt: &github.Timestamp{Time: now}},
+		})
+	})
+
+	count, err := c.CountAgentContinueComments(t.Context(), 123)
+	require.NoError(t, err)
+	assert.Equal(t, 1, count)
+
+	at, err := c.LastAgentContinueAt(t.Context(), 123)
+	require.NoError(t, err)
+	assert.WithinDuration(t, now, at, time.Second)
+
+	count, err = c.CountMergeConflictContinueComments(t.Context(), 123)
+	require.NoError(t, err)
+	assert.Equal(t, 1, count)
+
+	at, err = c.LastMergeConflictContinueAt(t.Context(), 123)
+	require.NoError(t, err)
+	assert.WithinDuration(t, now, at, time.Second)
+}
+
+func TestIsPRDraft(t *testing.T) {
+	t.Parallel()
+	c := &ghclient.Client{}
+	pr := &github.PullRequest{Draft: github.Ptr(true)}
+	draft := c.IsPRDraft(pr)
+	assert.True(t, draft)
+}
+
+func TestPostReviewComment(t *testing.T) {
+	t.Parallel()
+	c := setupMockGitHubAPI(t, func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodPost, r.Method)
+		w.WriteHeader(http.StatusCreated)
+	})
+	err := c.PostReviewComment(t.Context(), 123, "nice")
+	require.NoError(t, err)
+}
+
+func TestCountPrompts(t *testing.T) {
+	t.Parallel()
+	c := setupMockGitHubAPI(t, func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/reviews") {
+			_ = json.NewEncoder(w).Encode([]*github.PullRequestReview{{Body: github.Ptr("<!-- copilot-autocode:refinement -->")}})
+		} else {
+			_ = json.NewEncoder(w).Encode([]*github.IssueComment{{Body: github.Ptr("<!-- copilot-autocode:merge-conflict -->")}})
+		}
+	})
+	count, err := c.CountRefinementPromptsSent(t.Context(), 123)
+	require.NoError(t, err)
+	assert.Equal(t, 1, count)
+
+	count, err = c.CountMergeConflictAttempts(t.Context(), 123)
+	require.NoError(t, err)
+	assert.Equal(t, 1, count)
+}
+
+func TestPRManagement(t *testing.T) {
+	t.Parallel()
+	c := setupMockGitHubAPI(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut && strings.Contains(r.URL.Path, "/merge") {
+			_ = json.NewEncoder(w).Encode(&github.PullRequestMergeResult{Merged: github.Ptr(true)})
+		} else if r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/reviews") {
+			w.WriteHeader(http.StatusOK)
+		}
+	})
+	err := c.ApprovePR(t.Context(), 123)
+	require.NoError(t, err)
+
+	pr := &github.PullRequest{Number: github.Ptr(123)}
+	err = c.MergePR(t.Context(), pr)
+	require.NoError(t, err)
+}
+
+func TestRemoveLabel(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		status  int
+		wantErr bool
+	}{
+		{"success", http.StatusNoContent, false},
+		{"error", http.StatusInternalServerError, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			c := setupMockGitHubAPI(t, func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tc.status)
+			})
+			err := c.RemoveLabel(t.Context(), 123, "bug")
+			if tc.wantErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
 }
