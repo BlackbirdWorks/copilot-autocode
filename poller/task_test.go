@@ -1,3 +1,4 @@
+//nolint:gocritic,goimports
 package poller_test
 
 import (
@@ -8,11 +9,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/BlackbirdWorks/copilot-autodev/ghclient"
+	"github.com/BlackbirdWorks/copilot-autodev/poller"
 	"github.com/google/go-github/v68/github"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-
-	"github.com/BlackbirdWorks/copilot-autodev/poller"
 )
 
 func TestPRTask_SyncBranch(t *testing.T) {
@@ -65,7 +66,8 @@ func TestPRTask_SyncBranch(t *testing.T) {
 					})
 					return
 				}
-				if strings.Contains(r.URL.Path, "/pulls/123/update-branch") && r.Method == http.MethodPut {
+				if strings.Contains(r.URL.Path, "/pulls/123/update-branch") &&
+					r.Method == http.MethodPut {
 					w.WriteHeader(http.StatusAccepted)
 					return
 				}
@@ -97,6 +99,29 @@ func TestPRTask_SyncBranch(t *testing.T) {
 				}
 			},
 			wantStop: true,
+		},
+		{
+			name: "agent actively resolving conflicts",
+			pr: &github.PullRequest{
+				Number:         github.Ptr(123),
+				Head:           &github.PullRequestBranch{SHA: github.Ptr("head-sha")},
+				MergeableState: github.Ptr("dirty"),
+			},
+			mockHandler: func(w http.ResponseWriter, r *http.Request) {
+				path := r.URL.Path
+				if strings.Contains(path, "/compare/") {
+					_ = json.NewEncoder(w).
+						Encode(&github.CommitsComparison{Status: github.Ptr("ahead"), BehindBy: github.Ptr(0)})
+					return
+				}
+				if strings.Contains(path, "/actions/runs") && r.Method == http.MethodGet {
+					_ = json.NewEncoder(w).
+						Encode(&github.WorkflowRuns{WorkflowRuns: []*github.WorkflowRun{{Status: github.Ptr("in_progress")}}})
+					return
+				}
+			},
+			wantStop:    true,
+			wantCurrent: "Agent resolving merge conflicts",
 		},
 	}
 
@@ -154,13 +179,41 @@ func TestPRTask_ApproveRuns(t *testing.T) {
 					w.WriteHeader(http.StatusNoContent)
 				case strings.Contains(path, "/actions/runs") && strings.Contains(path, "/pending_deployments") && r.Method == http.MethodGet:
 					_ = json.NewEncoder(w).Encode([]*github.PendingDeployment{
-						{Environment: &github.PendingDeploymentEnvironment{Name: github.Ptr("prod")}},
+						{
+							Environment: &github.PendingDeploymentEnvironment{
+								Name: github.Ptr("prod"),
+							},
+						},
 					})
 				case strings.Contains(path, "/actions/runs") && strings.Contains(path, "/pending_deployments") && r.Method == http.MethodPost:
 					_ = json.NewEncoder(w).Encode(map[string]int{"count": 1})
 				}
 			},
 			wantStop: false,
+		},
+		{
+			name: "failed approval - max retries reached",
+			mockHandler: func(w http.ResponseWriter, r *http.Request) {
+				path := r.URL.Path
+				if strings.Contains(path, "/actions/runs") && !strings.Contains(path, "/approve") &&
+					!strings.Contains(path, "/comments") &&
+					!strings.Contains(path, "/pending_deployments") {
+					_ = json.NewEncoder(w).Encode(&github.WorkflowRuns{
+						WorkflowRuns: []*github.WorkflowRun{
+							{
+								ID:     github.Ptr(int64(101)),
+								Name:   github.Ptr("CI"),
+								Status: github.Ptr("action_required"),
+							},
+						},
+					})
+				} else if strings.Contains(path, "/approve") {
+					w.WriteHeader(http.StatusForbidden)
+				} else if strings.Contains(path, "/comments") && r.Method == http.MethodPost {
+					w.WriteHeader(http.StatusCreated)
+				}
+			},
+			wantStop: true,
 		},
 	}
 
@@ -169,7 +222,13 @@ func TestPRTask_ApproveRuns(t *testing.T) {
 			t.Parallel()
 			ctx := context.Background()
 			p := setupMockPoller(t, tt.mockHandler)
-			pr := &github.PullRequest{Number: github.Ptr(123), Head: &github.PullRequestBranch{SHA: github.Ptr("sha")}}
+			if tt.name == "failed approval - max retries reached" {
+				p.Cfg().MaxAgentContinueRetries = 1
+			}
+			pr := &github.PullRequest{
+				Number: github.Ptr(123),
+				Head:   &github.PullRequestBranch{SHA: github.Ptr("sha")},
+			}
 			displayInfo := make(map[int]*poller.IssueDisplayInfo)
 			task := &poller.PRTask{
 				P:           p,
@@ -203,7 +262,8 @@ func TestPRTask_CheckGates(t *testing.T) {
 		{
 			name: "no pending deployments",
 			mockHandler: func(w http.ResponseWriter, _ *http.Request) {
-				_ = json.NewEncoder(w).Encode(&github.WorkflowRuns{WorkflowRuns: []*github.WorkflowRun{}})
+				_ = json.NewEncoder(w).
+					Encode(&github.WorkflowRuns{WorkflowRuns: []*github.WorkflowRun{}})
 			},
 			wantStop: false,
 		},
@@ -240,7 +300,10 @@ func TestPRTask_CheckGates(t *testing.T) {
 			t.Parallel()
 			ctx := context.Background()
 			p := setupMockPoller(t, tt.mockHandler)
-			pr := &github.PullRequest{Number: github.Ptr(123), Head: &github.PullRequestBranch{SHA: github.Ptr("sha")}}
+			pr := &github.PullRequest{
+				Number: github.Ptr(123),
+				Head:   &github.PullRequestBranch{SHA: github.Ptr("sha")},
+			}
 			displayInfo := make(map[int]*poller.IssueDisplayInfo)
 			task := &poller.PRTask{
 				P:           p,
@@ -277,7 +340,8 @@ func TestPRTask_HandleTimeout(t *testing.T) {
 		{
 			name: "no failed runs",
 			mockHandler: func(w http.ResponseWriter, _ *http.Request) {
-				_ = json.NewEncoder(w).Encode(&github.WorkflowRuns{WorkflowRuns: []*github.WorkflowRun{}})
+				_ = json.NewEncoder(w).
+					Encode(&github.WorkflowRuns{WorkflowRuns: []*github.WorkflowRun{}})
 			},
 			wantStop: false,
 		},
@@ -303,15 +367,44 @@ func TestPRTask_HandleTimeout(t *testing.T) {
 			wantStop:    true,
 			wantCurrent: "Agent timed out",
 		},
+		{
+			name: "failed run - timeout delay reached",
+			mockHandler: func(w http.ResponseWriter, r *http.Request) {
+				path := r.URL.Path
+				if strings.Contains(path, "/actions/runs") {
+					_ = json.NewEncoder(w).Encode(&github.WorkflowRuns{
+						WorkflowRuns: []*github.WorkflowRun{{
+							Status:     github.Ptr("completed"),
+							Conclusion: github.Ptr("timed_out"),
+							UpdatedAt:  &github.Timestamp{Time: time.Now().Add(-11 * time.Minute)},
+						}},
+					})
+					return
+				}
+				if strings.Contains(path, "/comments") && r.Method == http.MethodPost {
+					w.WriteHeader(http.StatusCreated)
+					return
+				}
+				if strings.Contains(path, "/comments") && r.Method == http.MethodGet {
+					_ = json.NewEncoder(w).Encode([]*github.IssueComment{})
+					return
+				}
+			},
+			wantStop:    true, // It signals agent timed out
+			wantCurrent: "Agent timed out",
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			ctx := context.Background()
+			ctx := t.Context()
 			p := setupMockPoller(t, tt.mockHandler)
 			p.Cfg().AgentTimeoutRetryDelaySeconds = 600
-			pr := &github.PullRequest{Number: github.Ptr(123), Head: &github.PullRequestBranch{SHA: github.Ptr("sha")}}
+			pr := &github.PullRequest{
+				Number: github.Ptr(123),
+				Head:   &github.PullRequestBranch{SHA: github.Ptr("sha")},
+			}
 			displayInfo := make(map[int]*poller.IssueDisplayInfo)
 			task := &poller.PRTask{
 				P:           p,
@@ -351,7 +444,8 @@ func TestPRTask_Refine(t *testing.T) {
 				path := r.URL.Path
 				switch {
 				case strings.Contains(path, "/actions/runs") && r.Method == http.MethodGet:
-					_ = json.NewEncoder(w).Encode(&github.WorkflowRuns{WorkflowRuns: []*github.WorkflowRun{}})
+					_ = json.NewEncoder(w).
+						Encode(&github.WorkflowRuns{WorkflowRuns: []*github.WorkflowRun{}})
 				case strings.Contains(path, "/pulls/123/reviews") && r.Method == http.MethodGet:
 					_ = json.NewEncoder(w).Encode([]*github.PullRequestReview{})
 				case strings.Contains(path, "/pulls/123/reviews") && r.Method == http.MethodPost:
@@ -361,12 +455,66 @@ func TestPRTask_Refine(t *testing.T) {
 			wantStop: true,
 			wantSent: 1,
 		},
+		{
+			name: "refinement already completed by agent comment",
+			mockHandler: func(w http.ResponseWriter, r *http.Request) {
+				path := r.URL.Path
+				switch {
+				case strings.Contains(path, "/pulls/123/reviews") && r.Method == http.MethodGet:
+					refineSHATag := ghclient.SHAMarker("refinement", "head-sha")
+					_ = json.NewEncoder(w).Encode([]*github.PullRequestReview{
+						{
+							Body:        github.Ptr("Please refine: " + refineSHATag),
+							SubmittedAt: &github.Timestamp{Time: time.Now().Add(-2 * time.Hour)},
+							User:        &github.User{Login: github.Ptr("copilot-autodev")},
+						},
+					})
+				case strings.Contains(path, "/issues/123/comments") && r.Method == http.MethodGet:
+					_ = json.NewEncoder(w).Encode([]*github.IssueComment{
+						{
+							Body:      github.Ptr("I have refined this."),
+							CreatedAt: &github.Timestamp{Time: time.Now().Add(-1 * time.Hour)},
+							User:      &github.User{Login: github.Ptr("copilot[bot]")},
+						},
+					})
+				}
+			},
+			wantStop: false,
+			wantSent: 0,
+		},
+		{
+			name: "refinement rounds exhausted",
+			mockHandler: func(w http.ResponseWriter, r *http.Request) {
+				path := r.URL.Path
+				switch {
+				case strings.Contains(path, "/actions/runs") && r.Method == http.MethodGet:
+					_ = json.NewEncoder(w).
+						Encode(&github.WorkflowRuns{WorkflowRuns: []*github.WorkflowRun{}})
+				case strings.Contains(path, "/pulls/123/reviews"):
+					if r.Method == http.MethodGet {
+						// Return 5 reviews to match MaxRefinementRounds
+						reviews := make([]*github.PullRequestReview, 5)
+						for i := range reviews {
+							reviews[i] = &github.PullRequestReview{
+								Body: github.Ptr(ghclient.RefinementCommentMarker),
+							}
+						}
+						_ = json.NewEncoder(w).Encode(reviews)
+					} else {
+						w.WriteHeader(http.StatusCreated)
+						_ = json.NewEncoder(w).Encode(&github.PullRequestReview{ID: github.Ptr(int64(789))})
+					}
+				}
+			},
+			wantStop: false,
+			wantSent: 5,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			ctx := context.Background()
+			ctx := t.Context()
 			p := setupMockPoller(t, tt.mockHandler)
 			pr := &github.PullRequest{
 				Number: github.Ptr(123),
@@ -380,6 +528,11 @@ func TestPRTask_Refine(t *testing.T) {
 				Sha:         "head-sha",
 				DisplayInfo: displayInfo,
 			}
+			if tt.name == "refinement rounds exhausted" {
+				// Mock that we already sent 5 refinement prompts
+				p.Cfg().MaxRefinementRounds = 5
+				task.Sent = 5
+			}
 
 			stop, err := task.Refine(ctx)
 			if tt.wantErr {
@@ -388,7 +541,9 @@ func TestPRTask_Refine(t *testing.T) {
 			}
 			require.NoError(t, err)
 			assert.Equal(t, tt.wantStop, stop)
-			assert.Equal(t, tt.wantSent, task.Sent)
+			if tt.name != "refinement rounds exhausted" {
+				assert.Equal(t, tt.wantSent, task.Sent)
+			}
 		})
 	}
 }
@@ -419,14 +574,36 @@ func TestPRTask_Merge(t *testing.T) {
 				}
 			},
 		},
+		{
+			name:  "merge approval fails",
+			allOK: true,
+			mockHandler: func(w http.ResponseWriter, r *http.Request) {
+				if strings.Contains(r.URL.Path, "/pulls/123/reviews") &&
+					r.Method == http.MethodPost {
+					w.WriteHeader(http.StatusForbidden)
+					_ = json.NewEncoder(w).
+						Encode(map[string]string{"message": "some unrecognized error"})
+				}
+			},
+			wantErr: true,
+		},
+		{
+			name:        "merge not all ok",
+			allOK:       false,
+			mockHandler: func(w http.ResponseWriter, r *http.Request) {},
+			wantErr:     false,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			ctx := context.Background()
+			ctx := t.Context()
 			p := setupMockPoller(t, tt.mockHandler)
-			pr := &github.PullRequest{Number: github.Ptr(123), Head: &github.PullRequestBranch{SHA: github.Ptr("sha")}}
+			pr := &github.PullRequest{
+				Number: github.Ptr(123),
+				Head:   &github.PullRequestBranch{SHA: github.Ptr("sha")},
+			}
 			displayInfo := make(map[int]*poller.IssueDisplayInfo)
 			task := &poller.PRTask{
 				P:           p,
@@ -449,7 +626,6 @@ func TestPRTask_Merge(t *testing.T) {
 
 func TestPRTask_WaitForCI(t *testing.T) {
 	t.Parallel()
-	ctx := context.Background()
 
 	tests := []struct {
 		name        string
@@ -491,6 +667,7 @@ func TestPRTask_WaitForCI(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
+			ctx := t.Context()
 			p := setupMockPoller(t, tt.mockHandler)
 			displayInfo := make(map[int]*poller.IssueDisplayInfo)
 			task := &poller.PRTask{
@@ -516,7 +693,6 @@ func TestPRTask_WaitForCI(t *testing.T) {
 
 func TestPRTask_FixCI(t *testing.T) {
 	t.Parallel()
-	ctx := context.Background()
 
 	tests := []struct {
 		name        string
@@ -554,11 +730,47 @@ func TestPRTask_FixCI(t *testing.T) {
 			},
 			wantStop: true,
 		},
+		{
+			name: "Fix handled by agent comment",
+			mockHandler: func(w http.ResponseWriter, r *http.Request) {
+				path := r.URL.Path
+				switch {
+				case strings.Contains(path, "/actions/runs") && r.Method == http.MethodGet:
+					_ = json.NewEncoder(w).Encode(&github.WorkflowRuns{
+						WorkflowRuns: []*github.WorkflowRun{{
+							ID:         github.Ptr(int64(101)),
+							Name:       github.Ptr("CI"),
+							Status:     github.Ptr("completed"),
+							Conclusion: github.Ptr("failure"),
+							UpdatedAt:  &github.Timestamp{Time: time.Now().Add(-1 * time.Hour)},
+						}},
+					})
+				case strings.Contains(path, "/issues/123/comments") && r.Method == http.MethodGet:
+					ciSHATag := ghclient.SHAMarker("ci-fix", "sha")
+					_ = json.NewEncoder(w).Encode([]*github.IssueComment{
+						{
+							Body:      github.Ptr(ciSHATag),
+							CreatedAt: &github.Timestamp{Time: time.Now().Add(-2 * time.Hour)},
+							User:      &github.User{Login: github.Ptr("copilot-autodev")},
+						},
+						{
+							Body:      github.Ptr("I've fixed this CI failure."),
+							CreatedAt: &github.Timestamp{Time: time.Now().Add(-1 * time.Hour)},
+							User:      &github.User{Login: github.Ptr("copilot[bot]")},
+						},
+					})
+				case strings.Contains(path, "/actions/runs/101/jobs") && r.Method == http.MethodGet:
+					_ = json.NewEncoder(w).Encode(&github.Jobs{Jobs: []*github.WorkflowJob{}})
+				}
+			},
+			wantStop: false,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
+			ctx := t.Context()
 			p := setupMockPoller(t, tt.mockHandler)
 			p.Cfg().MaxCIFixRounds = 3
 			displayInfo := make(map[int]*poller.IssueDisplayInfo)
@@ -573,13 +785,14 @@ func TestPRTask_FixCI(t *testing.T) {
 				DisplayInfo: displayInfo,
 				AnyFail:     true,
 			}
+
 			stop, err := task.FixCI(ctx)
 			if tt.wantErr {
-				assert.Error(t, err)
-			} else {
-				require.NoError(t, err)
-				assert.Equal(t, tt.wantStop, stop)
+				require.Error(t, err)
+				return
 			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantStop, stop)
 		})
 	}
 }

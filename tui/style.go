@@ -8,9 +8,18 @@ const titleHPad = 2
 
 var (
 	// Column header colors.
-	headerQueue  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#0075ca")).Padding(0, 1)
-	headerCoding = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#e4b800")).Padding(0, 1)
-	headerReview = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#d93f0b")).Padding(0, 1)
+	HeaderQueue = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("#0075ca")).
+			Padding(0, 1)
+	HeaderCoding = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("#e4b800")).
+			Padding(0, 1)
+	HeaderReview = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("#d93f0b")).
+			Padding(0, 1)
 
 	// Column containers.
 	columnStyle = lipgloss.NewStyle().
@@ -28,7 +37,9 @@ var (
 	dimItemStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("#777777"))
 	issueNumStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#aaaaaa"))
 	prNumStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#5a9fe8"))
-	codeSpanStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#d2a8ff")) // GitHub magenta code span color
+	codeSpanStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#d2a8ff"))
+		// GitHub magenta code span color
 
 	// Status sub-line style: muted text shown below each item's title line,
 	// describing the current phase and next scheduled action.
@@ -56,15 +67,15 @@ var (
 			Align(lipgloss.Center)
 
 	// Badge styles (inline status chips).
-	badgeQueue = lipgloss.NewStyle().
+	BadgeQueue = lipgloss.NewStyle().
 			Background(lipgloss.Color("#0075ca")).
 			Foreground(lipgloss.Color("#ffffff")).
 			Padding(0, 1)
-	badgeCoding = lipgloss.NewStyle().
+	BadgeCoding = lipgloss.NewStyle().
 			Background(lipgloss.Color("#e4b800")).
 			Foreground(lipgloss.Color("#000000")).
 			Padding(0, 1)
-	badgeReview = lipgloss.NewStyle().
+	BadgeReview = lipgloss.NewStyle().
 			Background(lipgloss.Color("#d93f0b")).
 			Foreground(lipgloss.Color("#ffffff")).
 			Padding(0, 1)

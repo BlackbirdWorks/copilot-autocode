@@ -90,6 +90,13 @@ const (
 	// deployment gate) and the orchestrator's token cannot approve it.
 	// Combined with SHAMarker("deployment-pending", sha) for per-SHA dedup.
 	DeploymentPendingCommentMarker = "<!-- copilot-autodev:deployment-pending -->"
+
+	// AgentTypeCommentMarker is embedded in the tracking comment posted when
+	// an issue is promoted from the queue.  It records which agent backend
+	// ("cloud" or "cli") was used so the orchestrator can avoid switching
+	// agents mid-task after a config change.
+	// Format: <!-- copilot-autodev:agent-type:cloud -->.
+	AgentTypeCommentMarker = "<!-- copilot-autodev:agent-type:"
 )
 
 // FailedJobInfo describes a single failed CI job.
@@ -185,6 +192,9 @@ func NewTestClientWithGH(gh *github.Client, owner, repo string) *Client {
 	return &Client{gh: gh, owner: owner, repo: repo}
 }
 
+// GH returns the underlying *github.Client for direct API access.
+func (c *Client) GH() *github.Client { return c.gh }
+
 func (c *Client) httpClient() *http.Client {
 	if c.transport != nil {
 		return &http.Client{Transport: c.transport}
@@ -270,14 +280,22 @@ func (c *Client) SwapLabel(ctx context.Context, issueNum int, oldLabel, newLabel
 // CloseIssue closes the issue.
 func (c *Client) CloseIssue(ctx context.Context, issueNum int) error {
 	closed := "closed"
-	_, _, err := c.gh.Issues.Edit(ctx, c.owner, c.repo, issueNum, &github.IssueRequest{State: &closed})
+	_, _, err := c.gh.Issues.Edit(
+		ctx,
+		c.owner,
+		c.repo,
+		issueNum,
+		&github.IssueRequest{State: &closed},
+	)
 	return err
 }
 
 // IsMatchForIssue returns true if the PR's title, body, or head branch reference
 // the given issue number.
 func (c *Client) IsMatchForIssue(pr *github.PullRequest, issueNum int) bool {
-	bodyRe := regexp.MustCompile(fmt.Sprintf(`(?i)(?:^|\s)(?:fixes|closes|resolves)\s+#%d\b`, issueNum))
+	bodyRe := regexp.MustCompile(
+		fmt.Sprintf(`(?i)(?:^|\s)(?:fixes|closes|resolves)\s+#%d\b`, issueNum),
+	)
 	titleRe := regexp.MustCompile(fmt.Sprintf(`(?i)(?:^|\s)#%d\b`, issueNum))
 	branchRe := regexp.MustCompile(fmt.Sprintf(`(?i)(?:^|/)(?:issue-?)?%d(?:[-/]|$)`, issueNum))
 
@@ -293,7 +311,9 @@ func (c *Client) IsMatchForIssue(pr *github.PullRequest, issueNum int) bool {
 // FindLinkedPRFromComments scans an issue's comments for the PRLinkCommentMarker.
 // If found, it parses the PR number and returns it.
 func (c *Client) FindLinkedPRFromComments(ctx context.Context, issueNum int) (int, error) {
-	opts := &github.IssueListCommentsOptions{ListOptions: github.ListOptions{PerPage: perPageDefault}}
+	opts := &github.IssueListCommentsOptions{
+		ListOptions: github.ListOptions{PerPage: perPageDefault},
+	}
 	for {
 		comments, resp, err := c.gh.Issues.ListComments(ctx, c.owner, c.repo, issueNum, opts)
 		if err != nil {
@@ -324,7 +344,10 @@ func (c *Client) FindLinkedPRFromComments(ctx context.Context, issueNum int) (in
 
 // OpenPRForIssue finds the first open PR whose title or body references the issue.
 // It uses several discovery steps in order of reliability.
-func (c *Client) OpenPRForIssue(ctx context.Context, issue *github.Issue) (*github.PullRequest, error) {
+func (c *Client) OpenPRForIssue(
+	ctx context.Context,
+	issue *github.Issue,
+) (*github.PullRequest, error) {
 	issueNum := issue.GetNumber()
 
 	// 1. Check for explicit comment links on the ISSUE side first.
@@ -367,10 +390,14 @@ func (c *Client) OpenPRForIssue(ctx context.Context, issue *github.Issue) (*gith
 	return nil, nil
 }
 
-func (c *Client) findPRByIssueComment(ctx context.Context, issueNum int) (*github.PullRequest, error) {
+func (c *Client) findPRByIssueComment(
+	ctx context.Context,
+	issueNum int,
+) (*github.PullRequest, error) {
 	linkedPRNum, err := c.FindLinkedPRFromComments(ctx, issueNum)
 	if err != nil {
-		logger.Load(ctx).ErrorContext(ctx, "issue step 1 error", slog.Int("issue", issueNum), slog.Any("err", err))
+		logger.Load(ctx).
+			ErrorContext(ctx, "issue step 1 error", slog.Int("issue", issueNum), slog.Any("err", err))
 		return nil, err
 	}
 	if linkedPRNum == 0 {
@@ -391,7 +418,8 @@ func (c *Client) FindPRByMarkerComment(ctx context.Context, issueNum int) *githu
 	markerQuery := fmt.Sprintf("repo:%s/%s is:pr is:open %s", c.owner, c.repo, markerText)
 	markerResult, _, err := c.gh.Search.Issues(ctx, markerQuery, nil)
 	if err != nil {
-		logger.Load(ctx).ErrorContext(ctx, "issue step 3 error", slog.Int("issue", issueNum), slog.Any("err", err))
+		logger.Load(ctx).
+			ErrorContext(ctx, "issue step 3 error", slog.Int("issue", issueNum), slog.Any("err", err))
 		return nil
 	}
 	if len(markerResult.Issues) == 0 {
@@ -410,7 +438,8 @@ func (c *Client) FindPRBySearch(ctx context.Context, issueNum int) *github.PullR
 	query := fmt.Sprintf("repo:%s/%s is:pr is:open %d", c.owner, c.repo, issueNum)
 	result, _, err := c.gh.Search.Issues(ctx, query, nil)
 	if err != nil {
-		logger.Load(ctx).ErrorContext(ctx, "issue step 4 error", slog.Int("issue", issueNum), slog.Any("err", err))
+		logger.Load(ctx).
+			ErrorContext(ctx, "issue step 4 error", slog.Int("issue", issueNum), slog.Any("err", err))
 		return nil
 	}
 	if pr := c.FindMatchInSearchResults(ctx, issueNum, result.Issues); pr != nil {
@@ -427,7 +456,8 @@ func (c *Client) FindPRByListing(ctx context.Context, issueNum int) *github.Pull
 		ListOptions: github.ListOptions{PerPage: perPageMedium},
 	})
 	if err != nil {
-		logger.Load(ctx).ErrorContext(ctx, "issue step 5 error", slog.Int("issue", issueNum), slog.Any("err", err))
+		logger.Load(ctx).
+			ErrorContext(ctx, "issue step 5 error", slog.Int("issue", issueNum), slog.Any("err", err))
 		return nil
 	}
 	for _, pr := range prs {
@@ -467,7 +497,10 @@ func (c *Client) DiscoverPRViaJobID(ctx context.Context, issueNum int) *github.P
 // FindPRFromTimeline scans the issue's timeline for cross-reference events
 // originating from an open PR. This works immediately when a PR body says
 // "Fixes #N", without waiting for search indexing or relying on text matching.
-func (c *Client) FindPRFromTimeline(ctx context.Context, issueNum int) (*github.PullRequest, error) {
+func (c *Client) FindPRFromTimeline(
+	ctx context.Context,
+	issueNum int,
+) (*github.PullRequest, error) {
 	opts := &github.ListOptions{PerPage: perPageDefault}
 	for {
 		events, resp, err := c.gh.Issues.ListIssueTimeline(ctx, c.owner, c.repo, issueNum, opts)
@@ -569,17 +602,29 @@ func (c *Client) IsBranchBehindBase(ctx context.Context, pr *github.PullRequest)
 
 // PostComment posts a plain comment on the given issue/PR number.
 func (c *Client) PostComment(ctx context.Context, issueNum int, body string) error {
-	_, _, err := c.gh.Issues.CreateComment(ctx, c.owner, c.repo, issueNum, &github.IssueComment{Body: &body})
+	_, _, err := c.gh.Issues.CreateComment(
+		ctx,
+		c.owner,
+		c.repo,
+		issueNum,
+		&github.IssueComment{Body: &body},
+	)
 	return err
 }
 
 // PostReviewComment posts a review comment on a PR.
 func (c *Client) PostReviewComment(ctx context.Context, prNum int, body string) error {
 	event := "COMMENT"
-	_, _, err := c.gh.PullRequests.CreateReview(ctx, c.owner, c.repo, prNum, &github.PullRequestReviewRequest{
-		Body:  &body,
-		Event: &event,
-	})
+	_, _, err := c.gh.PullRequests.CreateReview(
+		ctx,
+		c.owner,
+		c.repo,
+		prNum,
+		&github.PullRequestReviewRequest{
+			Body:  &body,
+			Event: &event,
+		},
+	)
 	return err
 }
 
@@ -613,7 +658,9 @@ func (c *Client) CountRefinementPromptsSent(ctx context.Context, prNum int) (int
 // the count from GitHub means it survives process restarts.
 func (c *Client) CountMergeConflictAttempts(ctx context.Context, prNum int) (int, error) {
 	count := 0
-	opts := &github.IssueListCommentsOptions{ListOptions: github.ListOptions{PerPage: perPageDefault}}
+	opts := &github.IssueListCommentsOptions{
+		ListOptions: github.ListOptions{PerPage: perPageDefault},
+	}
 	for {
 		comments, resp, err := c.gh.Issues.ListComments(ctx, c.owner, c.repo, prNum, opts)
 		if err != nil {
@@ -635,9 +682,15 @@ func (c *Client) CountMergeConflictAttempts(ctx context.Context, prNum int) (int
 // ApprovePR approves the PR.
 func (c *Client) ApprovePR(ctx context.Context, prNum int) error {
 	event := "APPROVE"
-	_, _, err := c.gh.PullRequests.CreateReview(ctx, c.owner, c.repo, prNum, &github.PullRequestReviewRequest{
-		Event: &event,
-	})
+	_, _, err := c.gh.PullRequests.CreateReview(
+		ctx,
+		c.owner,
+		c.repo,
+		prNum,
+		&github.PullRequestReviewRequest{
+			Event: &event,
+		},
+	)
 	return err
 }
 
@@ -665,14 +718,17 @@ func (c *Client) UpdatePRBranch(ctx context.Context, prNum int) error {
 	if err != nil {
 		var acceptedErr *github.AcceptedError
 		if errors.As(err, &acceptedErr) {
-			logger.Load(ctx).InfoContext(ctx, "UpdatePRBranch: update scheduled (202 Accepted)", slog.Int("pr", prNum))
+			logger.Load(ctx).
+				InfoContext(ctx, "UpdatePRBranch: update scheduled (202 Accepted)", slog.Int("pr", prNum))
 			return nil
 		}
-		logger.Load(ctx).ErrorContext(ctx, "UpdatePRBranch: API error", slog.Int("pr", prNum), slog.Any("err", err))
+		logger.Load(ctx).
+			ErrorContext(ctx, "UpdatePRBranch: API error", slog.Int("pr", prNum), slog.Any("err", err))
 		return err
 	}
 	if resp != nil && resp.StatusCode == http.StatusAccepted {
-		logger.Load(ctx).InfoContext(ctx, "UpdatePRBranch: update scheduled (202 Accepted)", slog.Int("pr", prNum))
+		logger.Load(ctx).
+			InfoContext(ctx, "UpdatePRBranch: update scheduled (202 Accepted)", slog.Int("pr", prNum))
 		return nil
 	}
 	logger.Load(ctx).InfoContext(ctx, "UpdatePRBranch: update requested successfully",
@@ -690,10 +746,15 @@ func (c *Client) LatestWorkflowRun(ctx context.Context, sha string) ([]*github.W
 		}
 	}
 	logger.Load(ctx).InfoContext(ctx, "Listing workflow runs", slog.String("sha", sha))
-	runs, _, err := c.gh.Actions.ListRepositoryWorkflowRuns(ctx, c.owner, c.repo, &github.ListWorkflowRunsOptions{
-		HeadSHA:     sha,
-		ListOptions: github.ListOptions{PerPage: perPageDefault},
-	})
+	runs, _, err := c.gh.Actions.ListRepositoryWorkflowRuns(
+		ctx,
+		c.owner,
+		c.repo,
+		&github.ListWorkflowRunsOptions{
+			HeadSHA:     sha,
+			ListOptions: github.ListOptions{PerPage: perPageDefault},
+		},
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -798,9 +859,14 @@ func (c *Client) AnyWorkflowRunActive(ctx context.Context, sha string) (bool, er
 // This is used as a guard before re-invoking the agent: if a Copilot run
 // is already active, we skip re-invocation to avoid duplicate tasks.
 func (c *Client) HasActiveCopilotRun(ctx context.Context) (bool, error) {
-	runs, _, err := c.gh.Actions.ListRepositoryWorkflowRuns(ctx, c.owner, c.repo, &github.ListWorkflowRunsOptions{
-		ListOptions: github.ListOptions{PerPage: perPageSmall},
-	})
+	runs, _, err := c.gh.Actions.ListRepositoryWorkflowRuns(
+		ctx,
+		c.owner,
+		c.repo,
+		&github.ListWorkflowRunsOptions{
+			ListOptions: github.ListOptions{PerPage: perPageSmall},
+		},
+	)
 	if err != nil {
 		return false, err
 	}
@@ -865,7 +931,10 @@ func (c *Client) AllRunsSucceeded(ctx context.Context, sha string) (bool, bool, 
 // "timed_out") and completion time of the most recent completed-but-unsuccessful
 // workflow run for the given SHA.  Returns ("", zero, nil) when every run
 // succeeded/was skipped, or no runs exist at all.
-func (c *Client) LatestFailedRunConclusion(ctx context.Context, sha string) (string, time.Time, error) {
+func (c *Client) LatestFailedRunConclusion(
+	ctx context.Context,
+	sha string,
+) (string, time.Time, error) {
 	runs, err := c.LatestWorkflowRun(ctx, sha)
 	if err != nil {
 		return "", time.Time{}, err
@@ -899,7 +968,10 @@ func (c *Client) LatestFailedRunConclusion(ctx context.Context, sha string) (str
 // Note: status="completed" conclusion="action_required" is a different state —
 // it means the run has pending environment deployments; use
 // ApprovePendingDeployments for those.
-func (c *Client) ListActionRequiredRuns(ctx context.Context, sha string) ([]*github.WorkflowRun, error) {
+func (c *Client) ListActionRequiredRuns(
+	ctx context.Context,
+	sha string,
+) ([]*github.WorkflowRun, error) {
 	runs, err := c.LatestWorkflowRun(ctx, sha)
 	if err != nil {
 		return nil, err
@@ -918,7 +990,10 @@ func (c *Client) ListActionRequiredRuns(ctx context.Context, sha string) ([]*git
 // concluded with "action_required", which means one or more environment
 // protection rules are awaiting review approval.  These are approved via
 // ApprovePendingDeployments, not the fork-PR approve endpoint.
-func (c *Client) ListPendingDeploymentRuns(ctx context.Context, sha string) ([]*github.WorkflowRun, error) {
+func (c *Client) ListPendingDeploymentRuns(
+	ctx context.Context,
+	sha string,
+) ([]*github.WorkflowRun, error) {
 	runs, err := c.LatestWorkflowRun(ctx, sha)
 	if err != nil {
 		return nil, err
@@ -958,11 +1033,17 @@ func (c *Client) ApprovePendingDeployments(ctx context.Context, runID int64) (in
 	if len(envIDs) == 0 {
 		return 0, nil
 	}
-	_, _, err = c.gh.Actions.PendingDeployments(ctx, c.owner, c.repo, runID, &github.PendingDeploymentsRequest{
-		EnvironmentIDs: envIDs,
-		State:          "approved",
-		Comment:        "Auto-approved by copilot-autodev",
-	})
+	_, _, err = c.gh.Actions.PendingDeployments(
+		ctx,
+		c.owner,
+		c.repo,
+		runID,
+		&github.PendingDeploymentsRequest{
+			EnvironmentIDs: envIDs,
+			State:          "approved",
+			Comment:        "Auto-approved by copilot-autodev",
+		},
+	)
 	if err != nil {
 		return 0, fmt.Errorf("approve pending deployments for run %d: %w", runID, err)
 	}
@@ -978,7 +1059,8 @@ func (c *Client) RerunWorkflow(ctx context.Context, runID int64) error {
 	if err != nil {
 		return fmt.Errorf("rerun workflow run %d: %w", runID, err)
 	}
-	logger.Load(ctx).InfoContext(ctx, "Actions: re-run triggered for workflow run", slog.Int64("run", runID))
+	logger.Load(ctx).
+		InfoContext(ctx, "Actions: re-run triggered for workflow run", slog.Int64("run", runID))
 	return nil
 }
 
@@ -1007,7 +1089,8 @@ func (c *Client) ApproveWorkflowRun(ctx context.Context, runID int64) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNoContent {
-		logger.Load(ctx).InfoContext(ctx, "Actions: successfully approved run", slog.Int64("run", runID))
+		logger.Load(ctx).
+			InfoContext(ctx, "Actions: successfully approved run", slog.Int64("run", runID))
 		return nil
 	}
 
@@ -1038,7 +1121,9 @@ func (c *Client) CountCIFixPromptsSent(ctx context.Context, prNum int) (int, err
 // successful local merge resolution comment.
 func (c *Client) LastSuccessfulLocalResolutionAt(ctx context.Context, num int) (time.Time, error) {
 	var latest time.Time
-	opts := &github.IssueListCommentsOptions{ListOptions: github.ListOptions{PerPage: perPageDefault}}
+	opts := &github.IssueListCommentsOptions{
+		ListOptions: github.ListOptions{PerPage: perPageDefault},
+	}
 	for {
 		comments, resp, err := c.gh.Issues.ListComments(ctx, c.owner, c.repo, num, opts)
 		if err != nil {
@@ -1114,7 +1199,9 @@ func (c *Client) countCommentsWithMarkerSince(
 	since time.Time,
 ) (int, error) {
 	count := 0
-	opts := &github.IssueListCommentsOptions{ListOptions: github.ListOptions{PerPage: perPageDefault}}
+	opts := &github.IssueListCommentsOptions{
+		ListOptions: github.ListOptions{PerPage: perPageDefault},
+	}
 	for {
 		comments, resp, err := c.gh.Issues.ListComments(ctx, c.owner, c.repo, num, opts)
 		if err != nil {
@@ -1135,11 +1222,45 @@ func (c *Client) countCommentsWithMarkerSince(
 	return count, nil
 }
 
+// HasAgentCommentSince returns true if there is an issue/PR comment from the Copilot agent
+// created after the given time. It identifies the agent by checking if the login contains "copilot"
+// but is not the orchestrator itself ("copilot-autodev").
+func (c *Client) HasAgentCommentSince(ctx context.Context, num int, since time.Time) (bool, error) {
+	opts := &github.IssueListCommentsOptions{
+		ListOptions: github.ListOptions{PerPage: perPageDefault},
+	}
+	for {
+		comments, resp, err := c.gh.Issues.ListComments(ctx, c.owner, c.repo, num, opts)
+		if err != nil {
+			return false, fmt.Errorf("list comments (#%d): %w", num, err)
+		}
+		for _, cm := range comments {
+			if cm.GetCreatedAt().Time.After(since) {
+				login := strings.ToLower(cm.GetUser().GetLogin())
+				if strings.Contains(login, "copilot") && login != "copilot-autodev" {
+					return true, nil
+				}
+			}
+		}
+		if resp.NextPage == 0 {
+			break
+		}
+		opts.Page = resp.NextPage
+	}
+	return false, nil
+}
+
 // lastCommentWithMarker returns the timestamp of the most recent issue/PR
 // comment containing the given marker, or zero time if none exist.
-func (c *Client) lastCommentWithMarker(ctx context.Context, num int, marker string) (time.Time, error) {
+func (c *Client) lastCommentWithMarker(
+	ctx context.Context,
+	num int,
+	marker string,
+) (time.Time, error) {
 	var latest time.Time
-	opts := &github.IssueListCommentsOptions{ListOptions: github.ListOptions{PerPage: perPageDefault}}
+	opts := &github.IssueListCommentsOptions{
+		ListOptions: github.ListOptions{PerPage: perPageDefault},
+	}
 	for {
 		comments, resp, err := c.gh.Issues.ListComments(ctx, c.owner, c.repo, num, opts)
 		if err != nil {
@@ -1167,7 +1288,12 @@ func (c *Client) EnsureLabelsExist(ctx context.Context) error {
 		c.labelCoding: "e4e669",
 		c.labelReview: "d93f0b",
 	}
-	existing, _, err := c.gh.Issues.ListLabels(ctx, c.owner, c.repo, &github.ListOptions{PerPage: perPageDefault})
+	existing, _, err := c.gh.Issues.ListLabels(
+		ctx,
+		c.owner,
+		c.repo,
+		&github.ListOptions{PerPage: perPageDefault},
+	)
 	if err != nil {
 		return err
 	}
@@ -1191,7 +1317,10 @@ func (c *Client) EnsureLabelsExist(ctx context.Context) error {
 }
 
 // MergedPRForIssue finds the first *merged* PR whose title or body references the issue.
-func (c *Client) MergedPRForIssue(ctx context.Context, issue *github.Issue) (*github.PullRequest, error) {
+func (c *Client) MergedPRForIssue(
+	ctx context.Context,
+	issue *github.Issue,
+) (*github.PullRequest, error) {
 	issueNum := issue.GetNumber()
 	query := fmt.Sprintf("repo:%s/%s is:pr is:merged %d", c.owner, c.repo, issueNum)
 	opts := &github.SearchOptions{
@@ -1250,7 +1379,11 @@ func (c *Client) PRIsUpToDateWithBase(ctx context.Context, pr *github.PullReques
 // CodingLabeledAt returns the most recent time the given label was applied to
 // the issue by scanning the issue's event timeline.  Returns zero time if no
 // such event is found.
-func (c *Client) CodingLabeledAt(ctx context.Context, issueNum int, label string) (time.Time, error) {
+func (c *Client) CodingLabeledAt(
+	ctx context.Context,
+	issueNum int,
+	label string,
+) (time.Time, error) {
 	var latest time.Time
 	opts := &github.ListOptions{PerPage: perPageDefault}
 	for {
@@ -1277,7 +1410,9 @@ func (c *Client) CodingLabeledAt(ctx context.Context, issueNum int, label string
 // after the given time.  Pass zero time to count all nudge comments.
 func (c *Client) CountNudgesSince(ctx context.Context, issueNum int, since time.Time) (int, error) {
 	count := 0
-	opts := &github.IssueListCommentsOptions{ListOptions: github.ListOptions{PerPage: perPageDefault}}
+	opts := &github.IssueListCommentsOptions{
+		ListOptions: github.ListOptions{PerPage: perPageDefault},
+	}
 	for {
 		comments, resp, err := c.gh.Issues.ListComments(ctx, c.owner, c.repo, issueNum, opts)
 		if err != nil {
@@ -1302,7 +1437,9 @@ func (c *Client) CountNudgesSince(ctx context.Context, issueNum int, since time.
 // issue, or zero time if none exist.
 func (c *Client) LastNudgeAt(ctx context.Context, issueNum int) (time.Time, error) {
 	var latest time.Time
-	opts := &github.IssueListCommentsOptions{ListOptions: github.ListOptions{PerPage: perPageDefault}}
+	opts := &github.IssueListCommentsOptions{
+		ListOptions: github.ListOptions{PerPage: perPageDefault},
+	}
 	for {
 		comments, resp, err := c.gh.Issues.ListComments(ctx, c.owner, c.repo, issueNum, opts)
 		if err != nil {
@@ -1375,7 +1512,10 @@ func (c *Client) GetCopilotJobStatus(ctx context.Context, jobID string) (*Copilo
 }
 
 // GetJobStatusAt is the testable core of GetCopilotJobStatus.
-func (c *Client) GetJobStatusAt(ctx context.Context, endpoint, jobID string) (*CopilotJobStatus, error) {
+func (c *Client) GetJobStatusAt(
+	ctx context.Context,
+	endpoint, jobID string,
+) (*CopilotJobStatus, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, fmt.Errorf("build copilot job status request: %w", err)
@@ -1412,7 +1552,9 @@ func (c *Client) LatestCopilotJobID(ctx context.Context, issueNum int) (string, 
 	var latestJobID string
 	var latest time.Time
 
-	opts := &github.IssueListCommentsOptions{ListOptions: github.ListOptions{PerPage: perPageDefault}}
+	opts := &github.IssueListCommentsOptions{
+		ListOptions: github.ListOptions{PerPage: perPageDefault},
+	}
 	for {
 		comments, resp, err := c.gh.Issues.ListComments(ctx, c.owner, c.repo, issueNum, opts)
 		if err != nil {
@@ -1438,6 +1580,44 @@ func (c *Client) LatestCopilotJobID(ctx context.Context, issueNum int) (string, 
 		opts.Page = resp.NextPage
 	}
 	return latestJobID, nil
+}
+
+// ReadAgentType returns the agent type ("cloud" or "cli") recorded on the
+// issue, or an empty string if none has been recorded.  It reads the most
+// recent comment containing [AgentTypeCommentMarker].
+func (c *Client) ReadAgentType(ctx context.Context, issueNum int) string {
+	var result string
+	var latest time.Time
+
+	opts := &github.IssueListCommentsOptions{
+		ListOptions: github.ListOptions{PerPage: perPageDefault},
+	}
+	for {
+		comments, resp, err := c.gh.Issues.ListComments(ctx, c.owner, c.repo, issueNum, opts)
+		if err != nil {
+			return ""
+		}
+		for _, cm := range comments {
+			body := cm.GetBody()
+			idx := strings.Index(body, AgentTypeCommentMarker)
+			if idx == -1 {
+				continue
+			}
+			if t := cm.GetCreatedAt().Time; t.After(latest) {
+				start := idx + len(AgentTypeCommentMarker)
+				end := strings.Index(body[start:], "-->")
+				if end != -1 {
+					result = strings.TrimSpace(body[start : start+end])
+					latest = t
+				}
+			}
+		}
+		if resp.NextPage == 0 {
+			break
+		}
+		opts.Page = resp.NextPage
+	}
+	return result
 }
 
 // InvokeCopilotAgent creates a new Copilot coding-agent task by calling the
@@ -1573,7 +1753,11 @@ func (c *Client) MarkPRReady(ctx context.Context, pr *github.PullRequest) error 
 // HasReviewContaining returns true and the timestamp if any review comment on the PR contains
 // the given substring.  Used for SHA-based deduplication of CI-fix and
 // refinement prompts.
-func (c *Client) HasReviewContaining(ctx context.Context, prNum int, needle string) (bool, time.Time, error) {
+func (c *Client) HasReviewContaining(
+	ctx context.Context,
+	prNum int,
+	needle string,
+) (bool, time.Time, error) {
 	opts := &github.ListOptions{PerPage: perPageDefault}
 	for {
 		reviews, resp, err := c.gh.PullRequests.ListReviews(ctx, c.owner, c.repo, prNum, opts)
@@ -1595,8 +1779,14 @@ func (c *Client) HasReviewContaining(ctx context.Context, prNum int, needle stri
 
 // HasCommentContaining returns true and the timestamp if any issue comment on the given
 // issue/PR number contains the given substring.
-func (c *Client) HasCommentContaining(ctx context.Context, num int, needle string) (bool, time.Time, error) {
-	opts := &github.IssueListCommentsOptions{ListOptions: github.ListOptions{PerPage: perPageDefault}}
+func (c *Client) HasCommentContaining(
+	ctx context.Context,
+	num int,
+	needle string,
+) (bool, time.Time, error) {
+	opts := &github.IssueListCommentsOptions{
+		ListOptions: github.ListOptions{PerPage: perPageDefault},
+	}
 	for {
 		comments, resp, err := c.gh.Issues.ListComments(ctx, c.owner, c.repo, num, opts)
 		if err != nil {
@@ -1618,7 +1808,9 @@ func (c *Client) HasCommentContaining(ctx context.Context, num int, needle strin
 // DeleteCommentContaining finds the first comment on an issue/PR whose body
 // contains needle and deletes it.  Returns nil if no matching comment exists.
 func (c *Client) DeleteCommentContaining(ctx context.Context, num int, needle string) error {
-	opts := &github.IssueListCommentsOptions{ListOptions: github.ListOptions{PerPage: perPageDefault}}
+	opts := &github.IssueListCommentsOptions{
+		ListOptions: github.ListOptions{PerPage: perPageDefault},
+	}
 	for {
 		comments, resp, err := c.gh.Issues.ListComments(ctx, c.owner, c.repo, num, opts)
 		if err != nil {
@@ -1658,6 +1850,8 @@ type TimelineEntry struct {
 
 // FetchTimeline returns a chronological list of significant events for an issue,
 // combining label events and comments (with friendly marker detection).
+//
+//nolint:funlen
 func (c *Client) FetchTimeline(ctx context.Context, issueNum int) ([]TimelineEntry, error) {
 	var entries []TimelineEntry
 
@@ -1700,7 +1894,9 @@ func (c *Client) FetchTimeline(ctx context.Context, issueNum int) ([]TimelineEnt
 	}
 
 	// 2. Fetch comments and detect our markers for friendly labels.
-	cmOpts := &github.IssueListCommentsOptions{ListOptions: github.ListOptions{PerPage: perPageDefault}}
+	cmOpts := &github.IssueListCommentsOptions{
+		ListOptions: github.ListOptions{PerPage: perPageDefault},
+	}
 	for {
 		comments, resp, err := c.gh.Issues.ListComments(ctx, c.owner, c.repo, issueNum, cmOpts)
 		if err != nil {

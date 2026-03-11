@@ -1,3 +1,4 @@
+//nolint:gocritic,goimports
 package ghclient_test
 
 import (
@@ -25,7 +26,11 @@ func TestIsMatchForIssue_Units(t *testing.T) {
 	}{
 		{"title match", &github.PullRequest{Title: github.Ptr("Fix #123")}, true},
 		{"body match", &github.PullRequest{Body: github.Ptr("resolves #123")}, true},
-		{"branch match", &github.PullRequest{Head: &github.PullRequestBranch{Ref: github.Ptr("issue-123")}}, true},
+		{
+			"branch match",
+			&github.PullRequest{Head: &github.PullRequestBranch{Ref: github.Ptr("issue-123")}},
+			true,
+		},
 		{
 			"no match",
 			&github.PullRequest{
@@ -114,14 +119,20 @@ func TestFindMatchInSearchResults_Exhaustive(t *testing.T) {
 		{
 			name: "skip same number",
 			issues: []*github.Issue{
-				{Number: github.Ptr(123), PullRequestLinks: &github.PullRequestLinks{URL: github.Ptr("url")}},
+				{
+					Number:           github.Ptr(123),
+					PullRequestLinks: &github.PullRequestLinks{URL: github.Ptr("url")},
+				},
 			},
 			wantPRNum: 0,
 		},
 		{
 			name: "skip get error",
 			issues: []*github.Issue{
-				{Number: github.Ptr(456), PullRequestLinks: &github.PullRequestLinks{URL: github.Ptr("url")}},
+				{
+					Number:           github.Ptr(456),
+					PullRequestLinks: &github.PullRequestLinks{URL: github.Ptr("url")},
+				},
 			},
 			mock: func(w http.ResponseWriter, r *http.Request) {
 				w.WriteHeader(http.StatusInternalServerError)
@@ -131,7 +142,10 @@ func TestFindMatchInSearchResults_Exhaustive(t *testing.T) {
 		{
 			name: "skip closed or no match",
 			issues: []*github.Issue{
-				{Number: github.Ptr(456), PullRequestLinks: &github.PullRequestLinks{URL: github.Ptr("url")}},
+				{
+					Number:           github.Ptr(456),
+					PullRequestLinks: &github.PullRequestLinks{URL: github.Ptr("url")},
+				},
 			},
 			mock: func(w http.ResponseWriter, r *http.Request) {
 				_ = json.NewEncoder(w).Encode(&github.PullRequest{
@@ -144,7 +158,10 @@ func TestFindMatchInSearchResults_Exhaustive(t *testing.T) {
 		{
 			name: "success match",
 			issues: []*github.Issue{
-				{Number: github.Ptr(456), PullRequestLinks: &github.PullRequestLinks{URL: github.Ptr("url")}},
+				{
+					Number:           github.Ptr(456),
+					PullRequestLinks: &github.PullRequestLinks{URL: github.Ptr("url")},
+				},
 			},
 			mock: func(w http.ResponseWriter, r *http.Request) {
 				_ = json.NewEncoder(w).Encode(&github.PullRequest{

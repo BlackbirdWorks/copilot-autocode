@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/go-github/v68/github"
 
+	"github.com/BlackbirdWorks/copilot-autodev/agent"
 	"github.com/BlackbirdWorks/copilot-autodev/ghclient"
 	"github.com/BlackbirdWorks/copilot-autodev/pkgs/logger"
 	"github.com/BlackbirdWorks/copilot-autodev/resolver"
@@ -93,12 +94,13 @@ func (t *PRTask) SyncBranch(ctx context.Context) (bool, error) {
 		return false, err
 	}
 	if attempts >= t.P.cfg.MaxMergeConflictRetries {
-		return t.resolveConflictsLocally(ctx, attempts)
+		return t.ResolveConflictsLocally(ctx, attempts)
 	}
 	return t.requestMergeConflictFix(ctx)
 }
 
-func (t *PRTask) resolveConflictsLocally(ctx context.Context, _ int) (bool, error) {
+// ResolveConflictsLocally attempts to fix merge conflicts using an AI resolver.
+func (t *PRTask) ResolveConflictsLocally(ctx context.Context, _ int) (bool, error) {
 	failures, err := t.P.gh.CountLocalResolutionFailures(ctx, t.PR.GetNumber())
 	if err != nil {
 		return false, err
@@ -121,7 +123,10 @@ func (t *PRTask) resolveConflictsLocally(ctx context.Context, _ int) (bool, erro
 		delay := time.Duration(t.P.cfg.LocalMergeDelayMinutes) * time.Minute
 		if time.Since(lastFailure) < delay {
 			t.Display(IssueDisplayInfo{
-				Current:      fmt.Sprintf("Waiting for local AI merge retry delay (%d min)", t.P.cfg.LocalMergeDelayMinutes),
+				Current: fmt.Sprintf(
+					"Waiting for local AI merge retry delay (%d min)",
+					t.P.cfg.LocalMergeDelayMinutes,
+				),
 				Next:         "Retrying local AI merge resolution",
 				PR:           t.PR,
 				MergeLogPath: resolver.LogPath(t.PR.GetNumber()),
@@ -201,14 +206,21 @@ func (t *PRTask) requestMergeConflictFix(ctx context.Context) (bool, error) {
 	alreadyPosted, postedAt, _ := t.P.gh.HasCommentContaining(ctx, t.PR.GetNumber(), shaTag)
 	if alreadyPosted {
 		lastContinue, _ := t.P.gh.LastMergeConflictContinueAt(ctx, t.PR.GetNumber())
-		mergeTimeoutCfg := agentTimeoutCfg{
-			countFn:      t.P.gh.CountMergeConflictContinueComments,
-			nudgeMarker:  ghclient.MergeConflictContinueCommentMarker,
-			promptKind:   "merge-conflict prompt",
-			noticeFormat: "copilot-autodev: the Copilot coding agent became unresponsive while resolving merge conflicts and %d nudge(s) were exhausted. The PR has been left open in review for manual inspection.",
-			statusVerb:   "nudges",
+		mergeTimeoutCfg := AgentTimeoutCfg{
+			CountFn:      t.P.gh.CountMergeConflictContinueComments,
+			NudgeMarker:  ghclient.MergeConflictContinueCommentMarker,
+			PromptKind:   "merge-conflict prompt",
+			NoticeFormat: "copilot-autodev: the Copilot coding agent became unresponsive while resolving merge conflicts and %d nudge(s) were exhausted. The PR has been left open in review for manual inspection.",
+			StatusVerb:   "nudges",
 		}
-		t.P.HandleAgentTimeout(ctx, t.PR, t.Num, latestOf(postedAt, lastContinue), mergeTimeoutCfg, t.DisplayInfo)
+		t.P.HandleAgentTimeout(
+			ctx,
+			t.PR,
+			t.Num,
+			latestOf(postedAt, lastContinue),
+			mergeTimeoutCfg,
+			t.DisplayInfo,
+		)
 		t.Display(IssueDisplayInfo{
 			Current:     "Merge conflicts - waiting for Copilot",
 			Next:        "Re-checking next poll",
@@ -218,18 +230,19 @@ func (t *PRTask) requestMergeConflictFix(ctx context.Context) (bool, error) {
 		return true, nil
 	}
 
-	mergePrompt := t.P.cfg.MergeConflictPrompt
-	if !strings.Contains(mergePrompt, "@copilot") {
-		mergePrompt = "@copilot " + mergePrompt
-	}
-	comment := mergePrompt + "\n" + ghclient.MergeConflictCommentMarker + "\n" + shaTag
+	comment := t.P.cfg.MergeConflictPrompt + "\n" + ghclient.MergeConflictCommentMarker + "\n" + shaTag
 	t.Display(IssueDisplayInfo{
 		Current:     "Merge conflicts detected",
-		Next:        "Asked Copilot to fix",
+		Next:        "Asked agent to fix",
 		PR:          t.PR,
 		AgentStatus: "pending",
 	})
-	return true, t.P.gh.PostComment(ctx, t.PR.GetNumber(), comment)
+	return true, t.P.agent.SendPrompt(ctx, agent.PromptRequest{
+		PRNum:      t.PR.GetNumber(),
+		IssueNum:   t.Num,
+		PromptType: "merge-conflict",
+		Body:       comment,
+	})
 }
 
 func (t *PRTask) ApproveRuns(ctx context.Context) (bool, error) {
@@ -390,7 +403,10 @@ func (t *PRTask) HandleTimeout(ctx context.Context) (bool, error) {
 		)
 		_ = t.P.gh.PostComment(ctx, t.Num, notice)
 		t.Display(IssueDisplayInfo{
-			Current:     fmt.Sprintf("Agent timed out after %d retries — left in review", continueCount),
+			Current: fmt.Sprintf(
+				"Agent timed out after %d retries — left in review",
+				continueCount,
+			),
 			PR:          t.PR,
 			AgentStatus: "failed",
 		})
@@ -423,7 +439,12 @@ func (t *PRTask) HandleTimeout(ctx context.Context) (bool, error) {
 		return true, nil
 	}
 
-	_ = t.P.gh.PostComment(ctx, t.PR.GetNumber(), t.P.cfg.AgentContinuePrompt+"\n"+ghclient.AgentContinueCommentMarker)
+	_ = t.P.agent.SendPrompt(ctx, agent.PromptRequest{
+		PRNum:      t.PR.GetNumber(),
+		IssueNum:   t.Num,
+		PromptType: "continue",
+		Body:       t.P.cfg.AgentContinuePrompt + "\n" + ghclient.AgentContinueCommentMarker,
+	})
 	t.Display(IssueDisplayInfo{
 		Current: fmt.Sprintf(
 			"Agent timed out — continue posted (attempt %d of %d)",
@@ -459,6 +480,12 @@ func (t *PRTask) Refine(ctx context.Context) (bool, error) {
 	refSHATag := ghclient.SHAMarker("refinement", t.Sha)
 	alreadyPosted, postedAt, _ := t.P.gh.HasReviewContaining(ctx, t.PR.GetNumber(), refSHATag)
 	if alreadyPosted {
+		// If the agent replied after our refinement prompt without pushing a new commit,
+		// we consider the refinement round complete and proceed.
+		if hasReply, _ := t.P.agent.HasRespondedSince(ctx, t.PR.GetNumber(), postedAt); hasReply {
+			return false, nil
+		}
+
 		lastContinue, _ := t.P.gh.LastAgentContinueAt(ctx, t.PR.GetNumber())
 		if t.P.HandleAgentTimeout(
 			ctx,
@@ -474,7 +501,11 @@ func (t *PRTask) Refine(ctx context.Context) (bool, error) {
 			return true, nil
 		}
 		t.DisplayInfo[t.Num] = &IssueDisplayInfo{
-			Current:         fmt.Sprintf("Refinement %d/%d — waiting for agent", sent, t.P.cfg.MaxRefinementRounds),
+			Current: fmt.Sprintf(
+				"Refinement %d/%d — waiting for agent",
+				sent,
+				t.P.cfg.MaxRefinementRounds,
+			),
 			Next:            "Waiting for agent to push",
 			PR:              t.PR,
 			RefinementCount: sent,
@@ -484,14 +515,31 @@ func (t *PRTask) Refine(ctx context.Context) (bool, error) {
 		return true, nil
 	}
 
-	body := t.P.BuildRefinementCIPrompt(ctx, sent+1, t.P.cfg.MaxRefinementRounds, t.Num, t.AnyFail, t.Sha)
-	if err := t.P.gh.PostReviewComment(ctx, t.PR.GetNumber(), body); err != nil {
+	body := t.P.BuildRefinementCIPrompt(
+		ctx,
+		sent+1,
+		t.P.cfg.MaxRefinementRounds,
+		t.Num,
+		t.AnyFail,
+		t.Sha,
+	)
+	if err := t.P.agent.SendPrompt(ctx, agent.PromptRequest{
+		PRNum:      t.PR.GetNumber(),
+		IssueNum:   t.Num,
+		PromptType: "refinement",
+		Body:       body,
+		AsReview:   true,
+	}); err != nil {
 		return false, err
 	}
 	sent++
 	t.Sent = sent
 	t.DisplayInfo[t.Num] = &IssueDisplayInfo{
-		Current:         fmt.Sprintf("Refinement %d/%d posted — waiting for agent", sent, t.P.cfg.MaxRefinementRounds),
+		Current: fmt.Sprintf(
+			"Refinement %d/%d posted — waiting for agent",
+			sent,
+			t.P.cfg.MaxRefinementRounds,
+		),
 		Next:            "Waiting for agent to push",
 		PR:              t.PR,
 		RefinementCount: sent,
@@ -517,6 +565,12 @@ func (t *PRTask) FixCI(ctx context.Context) (bool, error) {
 	ciSHATag := ghclient.SHAMarker("ci-fix", t.Sha)
 	alreadyPosted, postedAt, _ := t.P.gh.HasCommentContaining(ctx, t.PR.GetNumber(), ciSHATag)
 	if alreadyPosted {
+		// If the agent replied without pushing a new commit, we consider this CI-fix
+		// round complete (even if it didn't fix the issue) and proceed.
+		if hasReply, _ := t.P.agent.HasRespondedSince(ctx, t.PR.GetNumber(), postedAt); hasReply {
+			return false, nil
+		}
+
 		t.P.WaitForAgentCycle(
 			ctx,
 			t.PR,
@@ -537,19 +591,28 @@ func (t *PRTask) FixCI(ctx context.Context) (bool, error) {
 		return false, err
 	}
 	body := fmt.Sprintf(
-		"@copilot (CI-fix %d of %d). The tests are still failing — please fix them.%s\n%s\n%s",
+		"(CI-fix %d of %d). The tests are still failing — please fix them.%s\n%s\n%s",
 		ciFixSent+1,
 		t.P.cfg.MaxCIFixRounds,
 		BuildCIFailureSection(workflowName, failedJobs),
 		ghclient.CIFixCommentMarker,
 		ciSHATag,
 	)
-	if err := t.P.gh.PostComment(ctx, t.PR.GetNumber(), body); err != nil {
+	if err := t.P.agent.SendPrompt(ctx, agent.PromptRequest{
+		PRNum:      t.PR.GetNumber(),
+		IssueNum:   t.Num,
+		PromptType: "ci-fix",
+		Body:       body,
+	}); err != nil {
 		return false, err
 	}
 	ciFixSent++
 	t.Display(IssueDisplayInfo{
-		Current:     fmt.Sprintf("CI-fix %d/%d posted — waiting for agent", ciFixSent, t.P.cfg.MaxCIFixRounds),
+		Current: fmt.Sprintf(
+			"CI-fix %d/%d posted — waiting for agent",
+			ciFixSent,
+			t.P.cfg.MaxCIFixRounds,
+		),
 		Next:        "Waiting for agent to push",
 		PR:          t.PR,
 		AgentStatus: "pending",
@@ -590,6 +653,9 @@ func (t *PRTask) Merge(ctx context.Context) error {
 	if err := t.P.gh.MergePR(ctx, t.PR); err != nil {
 		return err
 	}
+	// Clean up any persistent working directory used by the CLI agent.
+	t.P.agent.CleanupWorkdir(ctx, t.Num)
+
 	for _, lbl := range []string{t.P.cfg.LabelReview, t.P.cfg.LabelCoding, t.P.cfg.LabelQueue} {
 		_ = t.P.gh.RemoveLabel(ctx, t.Num, lbl)
 	}

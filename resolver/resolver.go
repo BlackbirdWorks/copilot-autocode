@@ -13,6 +13,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -32,7 +33,17 @@ type LogRunner struct {
 	log   io.Writer
 }
 
-func (r *LogRunner) Run(ctx context.Context, _ io.Writer, dir, token, name string, args ...string) error {
+// NewLogRunner creates a LogRunner that logs all command activity.
+func NewLogRunner(inner Runner, log io.Writer) *LogRunner {
+	return &LogRunner{inner: inner, log: log}
+}
+
+func (r *LogRunner) Run(
+	ctx context.Context,
+	_ io.Writer,
+	dir, token, name string,
+	args ...string,
+) error {
 	fmt.Fprintf(r.log, "$ %s %s\n", name, strings.Join(args, " "))
 	err := r.inner.Run(ctx, r.log, dir, token, name, args...)
 	if err != nil {
@@ -57,7 +68,12 @@ func (r *LogRunner) Output(ctx context.Context, dir, name string, args ...string
 // RealRunner implements Runner using [exec.Command].
 type RealRunner struct{}
 
-func (r *RealRunner) Run(ctx context.Context, out io.Writer, dir, token, name string, args ...string) error {
+func (r *RealRunner) Run(
+	ctx context.Context,
+	out io.Writer,
+	dir, token, name string,
+	args ...string,
+) error {
 	return run(ctx, out, dir, token, name, args...)
 }
 
@@ -88,10 +104,22 @@ func NewWithRunner(r Runner) *Resolver {
 	return &Resolver{runner: r}
 }
 
+// MergeLogDir returns the directory where merge resolution logs are stored.
+// It creates the directory if it does not exist.
+func MergeLogDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		home = os.TempDir()
+	}
+	dir := filepath.Join(home, ".copilot-autodev", "merge-logs")
+	_ = os.MkdirAll(dir, 0o755)
+	return dir
+}
+
 // LogPath returns the path where the merge resolution log for a given PR will
 // be written.
 func LogPath(prNum int) string {
-	return fmt.Sprintf("merge-resolution-pr-%d.log", prNum)
+	return filepath.Join(MergeLogDir(), fmt.Sprintf("merge-resolution-pr-%d.log", prNum))
 }
 
 // RunLocalResolution clones the PR head branch into a fresh temp directory,
@@ -103,6 +131,8 @@ func LogPath(prNum int) string {
 //
 // The GitHub token is used only for authenticated git operations and is
 // redacted from all returned error messages and log files.
+//
+//nolint:funlen
 func (r *Resolver) RunLocalResolution(
 	ctx context.Context,
 	token string,
@@ -113,7 +143,7 @@ func (r *Resolver) RunLocalResolution(
 	// Open the per-PR log file in append mode so previous attempt details
 	// are preserved when the user retries via 'r'.  A separator line marks
 	// each new attempt so the viewer stays readable.
-	logFile, err := os.OpenFile(LogPath(prNum), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	logFile, err := os.OpenFile(LogPath(prNum), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return "", fmt.Errorf("create merge log: %w", err)
 	}
@@ -124,7 +154,12 @@ func (r *Resolver) RunLocalResolution(
 	fmt.Fprintf(logFile, "Repo:   %s/%s\n", prd.Owner, prd.Repo)
 	fmt.Fprintf(logFile, "Head:   %s\n", prd.HeadBranch)
 	fmt.Fprintf(logFile, "Base:   %s\n", prd.BaseBranch)
-	fmt.Fprintf(logFile, "Cmd:    %s %s\n", cfg.AIMergeResolverCmd, strings.Join(cfg.AIMergeResolverArgs, " "))
+	fmt.Fprintf(
+		logFile,
+		"Cmd:    %s %s\n",
+		cfg.AIMergeResolverCmd,
+		strings.Join(cfg.AIMergeResolverArgs, " "),
+	)
 	fmt.Fprintf(logFile, "Prompt: %s\n\n", cfg.AIMergeResolverPrompt)
 
 	// Wrap the runner with logging.
@@ -173,6 +208,13 @@ func (r *Resolver) RunLocalResolution(
 	// "origin/main" won't exist even after `git fetch origin main`.
 	_ = lr.run(ctx, tmpDir, token, "git", "merge", "--no-edit", "FETCH_HEAD")
 
+	// Record the pre-resolution SHA to detect if the AI committed anything directly.
+	preSha, err := lr.output(ctx, tmpDir, "git", "rev-parse", "HEAD")
+	if err != nil {
+		return "", fmt.Errorf("git rev-parse HEAD (pre-resolution): %w", err)
+	}
+	preSha = strings.TrimSpace(preSha)
+
 	// Run the AI CLI in the working tree.
 	// Build args from cfg.AIMergeResolverArgs. If "{prompt}" appears in any arg,
 	// it is replaced by cfg.AIMergeResolverPrompt. Otherwise, the prompt is appended.
@@ -193,34 +235,44 @@ func (r *Resolver) RunLocalResolution(
 		return "", fmt.Errorf("AI resolver %q: %w", cfg.AIMergeResolverCmd, err)
 	}
 
-	// Stage everything the AI may have written.
-	if err := lr.run(ctx, tmpDir, token, "git", "add", "--all"); err != nil {
-		return "", fmt.Errorf("git add: %w", err)
-	}
-
-	// Verify the AI actually made changes — if nothing is staged the resolver
-	// did not resolve the conflicts and we should not create an empty commit.
-	statusOut, statusErr := lr.output(ctx, tmpDir, "git", "diff", "--cached", "--name-only")
-	if statusErr != nil {
-		return "", fmt.Errorf("git diff --cached: %w", statusErr)
-	}
-	if strings.TrimSpace(statusOut) == "" {
-		return "", fmt.Errorf("AI resolver %q made no changes; conflicts may still be present",
-			cfg.AIMergeResolverCmd)
-	}
-
-	// Commit.
-	if err := lr.run(ctx, tmpDir, token, "git", "commit",
-		"-m", "chore: resolve merge conflicts via AI"); err != nil {
-		return "", fmt.Errorf("git commit: %w", err)
-	}
-
-	// Get the new SHA
+	// Some AI CLI tools (like gh copilot resolve) may commit the changes directly.
+	// If the SHA changed, we consider it a success and don't need to commit.
 	newSha, err := lr.output(ctx, tmpDir, "git", "rev-parse", "HEAD")
 	if err != nil {
-		return "", fmt.Errorf("git rev-parse HEAD: %w", err)
+		return "", fmt.Errorf("git rev-parse HEAD (post-resolution): %w", err)
 	}
 	newSha = strings.TrimSpace(newSha)
+
+	if newSha == preSha {
+		// Stage anything the AI may have modified but not committed.
+		if err := lr.run(ctx, tmpDir, token, "git", "add", "--all"); err != nil {
+			return "", fmt.Errorf("git add: %w", err)
+		}
+
+		// Verify something is actually staged.
+		statusOut, statusErr := lr.output(ctx, tmpDir, "git", "diff", "--cached", "--name-only")
+		if statusErr != nil {
+			return "", fmt.Errorf("git diff --cached: %w", statusErr)
+		}
+		if strings.TrimSpace(statusOut) == "" {
+			return "", fmt.Errorf(
+				"AI resolver %q made no changes; conflicts may still be present",
+				cfg.AIMergeResolverCmd,
+			)
+		}
+
+		// Commit the staged changes.
+		if err := lr.run(ctx, tmpDir, token, "git", "commit", "-m", "chore: resolve merge conflicts via AI"); err != nil { //nolint:golines
+			return "", fmt.Errorf("git commit: %w", err)
+		}
+
+		// Get the final SHA.
+		newSha, err = lr.output(ctx, tmpDir, "git", "rev-parse", "HEAD")
+		if err != nil {
+			return "", fmt.Errorf("git rev-parse HEAD (final): %w", err)
+		}
+		newSha = strings.TrimSpace(newSha)
+	}
 
 	// Push the resolved branch back to origin.
 	if err := lr.run(ctx, tmpDir, token, "git", "push", "origin", prd.HeadBranch); err != nil {
@@ -302,6 +354,7 @@ func run(ctx context.Context, out io.Writer, dir, token, name string, args ...st
 				token, token, token,
 			)
 		}
+		//nolint:gosec // tokenPrefix is constructed from trusted values
 		cmd := exec.CommandContext(ctx, "sh", "-l", "-c", tokenPrefix+shellLine)
 		cmd.Dir = dir
 		cmd.Stdout = outputWriter
@@ -360,6 +413,50 @@ func output(ctx context.Context, dir, name string, args ...string) (string, erro
 		return "", err
 	}
 	return string(out), nil
+}
+
+// CleanupOldLogs removes merge resolution log files older than the given
+// retention duration.  Returns the number of files removed.
+func CleanupOldLogs(retention time.Duration) int {
+	dir := MergeLogDir()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0
+	}
+	cutoff := time.Now().Add(-retention)
+	removed := 0
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasPrefix(e.Name(), "merge-resolution-pr-") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if info.ModTime().Before(cutoff) {
+			_ = os.Remove(filepath.Join(dir, e.Name()))
+			removed++
+		}
+	}
+	return removed
+}
+
+// CleanupAllLogs removes all merge resolution log files.  Returns the count removed.
+func CleanupAllLogs() int {
+	dir := MergeLogDir()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0
+	}
+	removed := 0
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasPrefix(e.Name(), "merge-resolution-pr-") {
+			continue
+		}
+		_ = os.Remove(filepath.Join(dir, e.Name()))
+		removed++
+	}
+	return removed
 }
 
 // redact replaces all occurrences of token in s with "<redacted>" so that

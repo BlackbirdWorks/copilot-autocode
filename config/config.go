@@ -24,6 +24,7 @@ const (
 	defaultMaxCIFixRounds             = 6
 	defaultLogMaxSizeMB               = 5
 	defaultLogMaxFiles                = 3
+	defaultMergeLogRetentionMinutes   = 60
 
 	minPollIntervalSecs         = 10
 	minCopilotInvokeTimeoutSecs = 30
@@ -164,6 +165,27 @@ type Config struct {
 	// Older files are deleted when the limit is exceeded.  Default: 3.
 	LogMaxFiles int `yaml:"log_max_files"`
 
+	// MergeLogRetentionMinutes is how long merge resolution log files are
+	// kept after the associated PR is merged.  Set to 0 to keep forever.
+	// Default: 60 (1 hour).
+	MergeLogRetentionMinutes int `yaml:"merge_log_retention_minutes"`
+
+	// AgentType selects the coding agent backend.
+	// "cloud" (default) uses the GitHub Copilot cloud API.
+	// "cli" uses a local CLI agent (e.g. copilot, claude, aider).
+	AgentType string `yaml:"agent_type"`
+
+	// CLIAgentCmd is the executable invoked by the "cli" agent backend.
+	// Default: "copilot".
+	// Examples: "claude", "aider", "gh copilot".
+	CLIAgentCmd string `yaml:"cli_agent_cmd"`
+
+	// CLIAgentArgs are extra arguments passed to CLIAgentCmd.
+	// If the placeholder "{prompt}" appears in any argument, it is replaced
+	// with the task prompt.  Otherwise the prompt is appended at the end.
+	// Default: ["-p", "{prompt}"].
+	CLIAgentArgs []string `yaml:"cli_agent_args"`
+
 	// NotificationsEnabled controls whether desktop notifications are sent
 	// for key events (PR merged, agent timeout, manual fix needed).
 	// Default: true.
@@ -217,6 +239,10 @@ func DefaultConfig() *Config {
 		MaxCIFixRounds:                defaultMaxCIFixRounds,
 		LogMaxSizeMB:                  defaultLogMaxSizeMB,
 		LogMaxFiles:                   defaultLogMaxFiles,
+		MergeLogRetentionMinutes:      defaultMergeLogRetentionMinutes,
+		AgentType:                     "cloud",
+		CLIAgentCmd:                   "copilot",
+		CLIAgentArgs:                  []string{"-p", "{prompt}"},
 		NotificationsEnabled:          true,
 	}
 }
@@ -241,7 +267,10 @@ func (c *Config) validate() error {
 	case "squash", "merge", "rebase":
 	// valid
 	default:
-		return fmt.Errorf("config: merge_method must be squash, merge, or rebase (got %q)", c.MergeMethod)
+		return fmt.Errorf(
+			"config: merge_method must be squash, merge, or rebase (got %q)",
+			c.MergeMethod,
+		)
 	}
 	if c.MaxMergeConflictRetries < 0 {
 		c.MaxMergeConflictRetries = 0

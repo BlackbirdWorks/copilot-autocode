@@ -1,3 +1,4 @@
+//nolint:funlen,gocognitive,gocognit,gochecknoglobals,goconst,gocritic,gocyclo
 package tui
 
 import (
@@ -83,11 +84,11 @@ type mergeLogReloadMsg struct{}
 // startupReadyMsg fires 2 seconds after the first poll, dismissing the loading screen.
 type startupReadyMsg struct{}
 
-// loadingPunTickMsg rotates the loading pun every 1.4 s during startup.
+// loadingPunTickMsg rotates the loading pun every 1.82 s during startup.
 type loadingPunTickMsg struct{}
 
 func loadingPunTick() tea.Cmd {
-	return tea.Tick(1400*time.Millisecond, func(_ time.Time) tea.Msg {
+	return tea.Tick(2366*time.Millisecond, func(_ time.Time) tea.Msg {
 		return loadingPunTickMsg{}
 	})
 }
@@ -110,6 +111,33 @@ var loadingPuns = []string{
 	"SHA-ing my head in disbelief...",
 	"Squashing bugs and commits alike...",
 	"Rebasing reality on top of main...",
+	"Deploying thoughts and prayers...",
+	"Asking the AI to AI harder...",
+	"Have you tried turning the repo off and on again?",
+	"Aggressively ignoring flaky tests...",
+	"Blaming the intern (there is no intern)...",
+	"Pretending to understand the build system...",
+	"Merge conflicts are just code hugs gone wrong...",
+	"Offering blood sacrifices to the CI gods...",
+	"This is fine. Everything is fine.",
+	"Ctrl+Z won't save you here...",
+	"Calculating the meaning of exit code 137...",
+	"Gaslit by GitHub Actions since 2020...",
+	"Praying to the LGTM deities...",
+	"git push --force-with-lease (we're responsible adults)...",
+	"rm -rf node_modules && npm install (the universal fix)...",
+	"Writing code that writes code that reviews code...",
+	"Reticulating splines...",
+	"Downloading more RAM...",
+	"Blaming the compiler...",
+	"Convincing the agent to work weekends...",
+	"Refactoring the refactor...",
+	"Adding more technical debt...",
+	"Bribing the linter...",
+	"Checking if the cloud is still floating...",
+	"Simulating productivity...",
+	"Piping /dev/urandom to prod...",
+	"Re-learning how to exit vim...",
 }
 
 // activityFeedMsg delivers fetched timeline entries to the TUI.
@@ -143,8 +171,9 @@ type Model struct {
 	logsCopied bool // true if logs were recently copied to clipboard
 
 	// Cursor selection state.
-	selectedCol int // 0=queue, 1=coding, 2=review
-	selectedRow int // 0-indexed within the selected column
+	selectedCol int    // 0=queue, 1=coding, 2=review
+	selectedRow int    // 0-indexed within the selected column
+	colOffsets  [3]int // top visible row index for each column
 
 	// Command channel for sending actions back to the poller.
 	commandCh chan<- poller.Command
@@ -181,12 +210,20 @@ type Model struct {
 	// Startup loading screen state.
 	startupDone   bool // true once the first poll + grace period is done
 	loadingPunIdx int  // index into loadingPuns
+
+	agentType string // "cloud" or "cli" — displayed in the title bar
 }
 
 // New creates a fresh Model.  commandCh is used to send actions back to the
 // poller (e.g. retry merge resolution).  It may be nil if no commands are
 // needed.  gh is used for fetching timeline data (activity feed).
-func New(owner, repo string, interval int, commandCh chan<- poller.Command, gh *ghclient.Client) Model {
+func New(
+	owner, repo string,
+	interval int,
+	commandCh chan<- poller.Command,
+	gh *ghclient.Client,
+	agentType string,
+) Model {
 	sp := spinner.New()
 	sp.Spinner = spinner.Spinner{
 		Frames: []string{"-", "\\", "|", "/"},
@@ -202,6 +239,7 @@ func New(owner, repo string, interval int, commandCh chan<- poller.Command, gh *
 		interval:    interval,
 		commandCh:   commandCh,
 		gh:          gh,
+		agentType:   agentType,
 	}
 }
 
@@ -209,6 +247,95 @@ func New(owner, repo string, interval int, commandCh chan<- poller.Command, gh *
 func (m Model) Init() tea.Cmd {
 	return tea.Batch(m.spinner.Tick, secondTick(), loadingPunTick())
 }
+
+// Queue returns the current queue items.
+func (m Model) Queue() []*poller.State { return m.queue }
+
+// Coding returns the items currently in coding.
+func (m Model) Coding() []*poller.State { return m.coding }
+
+// Review returns the items currently in review.
+func (m Model) Review() []*poller.State { return m.review }
+
+// SelectedCol returns the index of the selected column.
+func (m Model) SelectedCol() int { return m.selectedCol }
+
+// SelectedRow returns the index of the selected row.
+func (m Model) SelectedRow() int { return m.selectedRow }
+
+// Width returns the model width.
+func (m Model) Width() int { return m.width }
+
+// Height returns the model height.
+func (m Model) Height() int { return m.height }
+
+// ColOffsets returns the column viewport offsets (test helper).
+func (m Model) ColOffsets() [3]int { return m.colOffsets }
+
+// DetailPaneOpen returns true if the detail pane is currently open.
+func (m Model) DetailPaneOpen() bool { return m.detailPaneOpen }
+
+// LogViewerOpen returns true if the log viewer is currently open.
+func (m Model) LogViewerOpen() bool { return m.logViewerOpen }
+
+// LogViewerTitle returns the current log viewer title.
+func (m Model) LogViewerTitle() string { return m.logViewerTitle }
+
+// ActivityFeedOpen returns whether the activity feed is currently visible.
+func (m Model) ActivityFeedOpen() bool { return m.activityFeedOpen }
+
+// ActivityFeedScroll returns the scroll position of the activity feed overlay.
+func (m Model) ActivityFeedScroll() int { return m.activityFeedScroll }
+
+// UpdatePollEvent manually injects a poll event (test helper).
+func (m Model) UpdatePollEvent(e poller.Event) Model {
+	tm, _ := m.Update(PollEvent{Event: e})
+	return tm.(Model) //nolint:errcheck
+}
+
+// UpdateActivityFeed manually injects activity feed data (test helper).
+func (m Model) UpdateActivityFeed(entries []ghclient.TimelineEntry, err error) Model {
+	tm, _ := m.Update(activityFeedMsg{entries: entries, err: err})
+	return tm.(Model) //nolint:errcheck
+}
+
+// SetActivityFeedOpen manually sets the activity feed open state (test helper).
+func (m *Model) SetActivityFeedOpen(open bool) { m.activityFeedOpen = open }
+
+// ReloadMergeLog manually triggers a reload of the merge log (test helper).
+func (m Model) ReloadMergeLog() Model {
+	return m.reloadMergeLog()
+}
+
+// DoneStartup force-dismisses the loading screen (test helper).
+func (m *Model) DoneStartup() { m.startupDone = true }
+
+// SetLogFilePath sets the path to the main log file (test helper).
+func (m *Model) SetLogFilePath(path string) { m.logFilePath = path }
+
+// SetLogViewerLines directly sets the log viewer lines (test helper).
+func (m Model) SetLogViewerLines(lines []string) Model {
+	m.logViewerLines = lines
+	return m
+}
+
+// SetLogViewerOpen directly sets the log viewer open state (test helper).
+func (m Model) SetLogViewerOpen(open bool) Model {
+	m.logViewerOpen = open
+	return m
+}
+
+// LogViewerScroll returns the current log viewer scroll offset (test helper).
+func (m Model) LogViewerScroll() int { return m.logViewerScroll }
+
+// LogViewerLines returns the lines currently in the log viewer (test helper).
+func (m Model) LogViewerLines() []string { return m.logViewerLines }
+
+// DetailPaneScroll returns the current detail pane scroll offset (test helper).
+func (m Model) DetailPaneScroll() int { return m.detailPaneScroll }
+
+// ActionFeedback returns the current action feedback message (test helper).
+func (m Model) ActionFeedback() string { return m.actionFeedback }
 
 // columnItems returns the items slice for the given column index.
 func (m Model) columnItems(col int) []*poller.State {
@@ -224,11 +351,13 @@ func (m Model) columnItems(col int) []*poller.State {
 	}
 }
 
-// clampSelection ensures selectedRow is within bounds for the current column.
+// clampSelection ensures selectedRow is within bounds for the current column
+// and updates the viewport offset so the selected row is always visible.
 func (m Model) clampSelection() Model {
 	items := m.columnItems(m.selectedCol)
 	if len(items) == 0 {
 		m.selectedRow = 0
+		m.colOffsets[m.selectedCol] = 0
 		return m
 	}
 	if m.selectedRow >= len(items) {
@@ -237,6 +366,45 @@ func (m Model) clampSelection() Model {
 	if m.selectedRow < 0 {
 		m.selectedRow = 0
 	}
+
+	// Simple physical dimension calculations based on window size.
+	// If m.height/m.width are zero (e.g. before first resize), skip viewport clamping.
+	if m.height == 0 || m.width == 0 {
+		return m
+	}
+
+	reservedRows := tuiChromeRows + tuiLogBoxHeight + tuiBorderRows
+	colHeight := max(m.height-reservedRows, tuiColMinHeight)
+
+	colWidth := max((m.width-tuiColSidePad)/tuiNumCols, tuiColMinWidth)
+	if m.selectedCol == tuiNumCols-1 {
+		colWidth = max(m.width-tuiColSidePad-colWidth*(tuiNumCols-1), colWidth)
+	}
+
+	// 1. Scroll up if the cursor explicitly moved above the viewport offset.
+	if m.selectedRow < m.colOffsets[m.selectedCol] {
+		m.colOffsets[m.selectedCol] = m.selectedRow
+	}
+
+	// 2. Scroll down if the cursor is pushed below the physical bottom of the frame.
+	for {
+		linesUsed := 2 // Header space + internal padding
+		for i := m.colOffsets[m.selectedCol]; i <= m.selectedRow; i++ {
+			_, itemLines := m.renderItem(items[i], colWidth, i == m.selectedRow)
+			linesUsed += itemLines
+		}
+		if linesUsed > colHeight-2 && m.colOffsets[m.selectedCol] < m.selectedRow {
+			m.colOffsets[m.selectedCol]++
+		} else {
+			break
+		}
+	}
+
+	// 3. Safety cap in case list shrinks drastically.
+	if m.colOffsets[m.selectedCol] >= len(items) {
+		m.colOffsets[m.selectedCol] = max(0, len(items)-1)
+	}
+
 	return m
 }
 
@@ -284,6 +452,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case activityFeedMsg:
 			return m.handleActivityFeedMsg(msg)
+		case mergeLogReloadMsg:
+			if m.logViewerOpen && m.mergeLogTailing {
+				atBottom := m.logViewerScroll == 0
+				m = m.reloadMergeLog()
+				if atBottom {
+					m.logViewerScroll = 0
+				}
+				return m, mergeLogReloadTick()
+			}
+			return m, nil
 		}
 		return m, nil
 	}
@@ -312,12 +490,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "up", "k":
 			if m.selectedRow > 0 {
 				m.selectedRow--
+				m = m.clampSelection()
 			}
 			return m, nil
 		case "down", "j":
 			items := m.columnItems(m.selectedCol)
 			if m.selectedRow < len(items)-1 {
 				m.selectedRow++
+				m = m.clampSelection()
 			}
 			return m, nil
 		case "left", "h":
@@ -336,7 +516,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Actions.
 		case "r":
 			var cmd tea.Cmd
-			m, cmd = m.handleRetryMerge()
+			m, cmd = m.handleRetry()
 			return m, cmd
 		case "t":
 			var cmd tea.Cmd
@@ -353,6 +533,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "-":
 			var cmd tea.Cmd
 			m, cmd = m.handlePriority(-1)
+			return m, cmd
+
+		// Cleanup.
+		case "x":
+			var cmd tea.Cmd
+			m, cmd = m.handleCleanWorkdir()
+			return m, cmd
+		case "X":
+			var cmd tea.Cmd
+			m, cmd = m.handleCleanAll()
 			return m, cmd
 
 		// Overlays.
@@ -414,13 +604,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case mergeLogReloadMsg:
 		if m.logViewerOpen && m.mergeLogTailing {
-			// Re-read and only auto-scroll if the user is already at the bottom.
-			atBottom := m.logViewerScroll == 0
-			m = m.reloadMergeLog()
-			if atBottom {
-				m.logViewerScroll = 0
-			}
-			return m, mergeLogReloadTick()
+			// Handled by the generic intercept block when overlay is open.
+			return m, nil
 		}
 		return m, nil
 
@@ -448,21 +633,71 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// handleRetryMerge sends a retry-merge command for the selected item if applicable.
-func (m Model) handleRetryMerge() (Model, tea.Cmd) {
+// handleRetry sends a retry command for the selected item.  It handles both
+// merge-conflict retries (review column) and CLI agent task retries (coding column).
+func (m Model) handleRetry() (Model, tea.Cmd) {
 	s := m.selectedState()
-	if s == nil || s.CurrentStatus != mergeFixStatus || s.PR == nil {
+	if s == nil || m.commandCh == nil {
 		return m, nil
 	}
-	if m.commandCh == nil {
+
+	// Retry merge resolution (existing behavior).
+	if s.CurrentStatus == mergeFixStatus && s.PR != nil {
+		m.commandCh <- poller.Command{
+			Action: "retry-merge",
+			PRNum:  s.PR.GetNumber(),
+		}
+		m.actionFeedback = fmt.Sprintf("Retry merge resolution queued for PR#%d", s.PR.GetNumber())
+		return m, tea.Tick(
+			tuiCopyFeedbackDuration,
+			func(_ time.Time) tea.Msg { return clearActionMsg{} },
+		)
+	}
+
+	// Retry a failed CLI agent task.
+	if m.selectedCol == 1 && s.AgentStatus == "failed" {
+		m.commandCh <- poller.Command{
+			Action:   "retry-task",
+			IssueNum: s.Issue.GetNumber(),
+		}
+		m.actionFeedback = fmt.Sprintf("Retry task queued for issue #%d", s.Issue.GetNumber())
+		return m, tea.Tick(
+			tuiCopyFeedbackDuration,
+			func(_ time.Time) tea.Msg { return clearActionMsg{} },
+		)
+	}
+
+	return m, nil
+}
+
+// handleCleanWorkdir removes the working directory for the selected item's issue.
+func (m Model) handleCleanWorkdir() (Model, tea.Cmd) {
+	s := m.selectedState()
+	if s == nil || m.commandCh == nil {
 		return m, nil
 	}
 	m.commandCh <- poller.Command{
-		Action: "retry-merge",
-		PRNum:  s.PR.GetNumber(),
+		Action:   "clean-workdir",
+		IssueNum: s.Issue.GetNumber(),
 	}
-	m.actionFeedback = fmt.Sprintf("Retry merge resolution queued for PR#%d", s.PR.GetNumber())
-	return m, tea.Tick(tuiCopyFeedbackDuration, func(_ time.Time) tea.Msg { return clearActionMsg{} })
+	m.actionFeedback = fmt.Sprintf("Cleaned workdir for issue #%d", s.Issue.GetNumber())
+	return m, tea.Tick(
+		tuiCopyFeedbackDuration,
+		func(_ time.Time) tea.Msg { return clearActionMsg{} },
+	)
+}
+
+// handleCleanAll removes all working directories and merge logs.
+func (m Model) handleCleanAll() (Model, tea.Cmd) {
+	if m.commandCh == nil {
+		return m, nil
+	}
+	m.commandCh <- poller.Command{Action: "clean-all"}
+	m.actionFeedback = "Cleaning all workdirs and merge logs..."
+	return m, tea.Tick(
+		tuiCopyFeedbackDuration,
+		func(_ time.Time) tea.Msg { return clearActionMsg{} },
+	)
 }
 
 // handleTakeover sends a takeover command for the selected item.
@@ -476,7 +711,10 @@ func (m Model) handleTakeover() (Model, tea.Cmd) {
 		IssueNum: s.Issue.GetNumber(),
 	}
 	m.actionFeedback = fmt.Sprintf("Manual takeover requested for #%d", s.Issue.GetNumber())
-	return m, tea.Tick(tuiCopyFeedbackDuration, func(_ time.Time) tea.Msg { return clearActionMsg{} })
+	return m, tea.Tick(
+		tuiCopyFeedbackDuration,
+		func(_ time.Time) tea.Msg { return clearActionMsg{} },
+	)
 }
 
 // handleForceRerunCI sends a rerun-ci command for the selected item's PR.
@@ -490,7 +728,10 @@ func (m Model) handleForceRerunCI() (Model, tea.Cmd) {
 		PRNum:  s.PR.GetNumber(),
 	}
 	m.actionFeedback = fmt.Sprintf("CI re-run requested for PR#%d", s.PR.GetNumber())
-	return m, tea.Tick(tuiCopyFeedbackDuration, func(_ time.Time) tea.Msg { return clearActionMsg{} })
+	return m, tea.Tick(
+		tuiCopyFeedbackDuration,
+		func(_ time.Time) tea.Msg { return clearActionMsg{} },
+	)
 }
 
 // handlePriority sends a priority adjustment for the selected queue item.
@@ -513,7 +754,10 @@ func (m Model) handlePriority(delta int) (Model, tea.Cmd) {
 		IssueNum: s.Issue.GetNumber(),
 	}
 	m.actionFeedback = fmt.Sprintf("Priority %s for #%d", label, s.Issue.GetNumber())
-	return m, tea.Tick(tuiCopyFeedbackDuration, func(_ time.Time) tea.Msg { return clearActionMsg{} })
+	return m, tea.Tick(
+		tuiCopyFeedbackDuration,
+		func(_ time.Time) tea.Msg { return clearActionMsg{} },
+	)
 }
 
 // openDetailPane builds and opens the detail pane overlay for the selected item.
@@ -530,7 +774,10 @@ func (m Model) openDetailPane() Model {
 	lines = append(lines, sep)
 	lines = append(lines, fmt.Sprintf("  URL:      %s", s.Issue.GetHTMLURL()))
 	lines = append(lines, fmt.Sprintf("  Status:   %s", s.Status))
-	lines = append(lines, fmt.Sprintf("  Created:  %s", ghclient.TimeAgo(s.Issue.GetCreatedAt().Time)))
+	lines = append(
+		lines,
+		fmt.Sprintf("  Created:  %s", ghclient.TimeAgo(s.Issue.GetCreatedAt().Time)),
+	)
 
 	// Pipeline progress bar.
 	lines = append(lines, "")
@@ -567,7 +814,10 @@ func (m Model) openDetailPane() Model {
 		lines = append(lines, fmt.Sprintf("  Next:        %s", next))
 	}
 	if s.RefinementMax > 0 {
-		lines = append(lines, fmt.Sprintf("  Refinement:  %d / %d", s.RefinementCount, s.RefinementMax))
+		lines = append(
+			lines,
+			fmt.Sprintf("  Refinement:  %d / %d", s.RefinementCount, s.RefinementMax),
+		)
 	}
 	if s.AgentStatus != "" {
 		lines = append(lines, fmt.Sprintf("  Agent:       %s", s.AgentStatus))
@@ -627,7 +877,10 @@ func RenderPipelineBar(s *poller.State) string {
 
 	// Review pipeline stages in order.
 	stages := []stage{
-		{"Branch Sync", []string{"conflict", "branch", "resolv", "merge conflict", "Merge resolved"}},
+		{
+			"Branch Sync",
+			[]string{"conflict", "branch", "resolv", "merge conflict", "Merge resolved"},
+		},
 		{"CI Approval", []string{"approval", "Approving", "action_required", "Waiting for manual"}},
 		{"Deploy Gates", []string{"deployment", "deploy"}},
 		{"CI Checks", []string{"CI running", "waiting for all checks", "failed", "checks"}},
@@ -829,15 +1082,19 @@ func (m Model) View() string {
 	// Give leftover chars to the last column so columns fill the full terminal.
 	lastColWidth := max(m.width-tuiColSidePad-colWidth*(tuiNumCols-1), colWidth)
 
+	agentLabel := "cloud"
+	if m.agentType != "" {
+		agentLabel = m.agentType
+	}
 	title := titleStyle.Width(m.width).Render(
-		fmt.Sprintf(" [BOT] Copilot Orchestrator - %s/%s ", m.owner, m.repo),
+		fmt.Sprintf(" [BOT] Copilot Orchestrator - %s/%s  [agent: %s] ", m.owner, m.repo, agentLabel),
 	)
 
-	queueCol := m.renderColumn("LIST Queue", headerQueue, badgeQueue,
+	queueCol := m.renderColumn("LIST Queue", HeaderQueue, BadgeQueue,
 		m.queue, colWidth, colHeight, 0)
-	codingCol := m.renderColumn("RUN  Active (Coding)", headerCoding, badgeCoding,
+	codingCol := m.renderColumn("RUN  Active (Coding)", HeaderCoding, BadgeCoding,
 		m.coding, colWidth, colHeight, 1)
-	reviewCol := m.renderColumn("TEST In Review (CI/Fix)", headerReview, badgeReview,
+	reviewCol := m.renderColumn("TEST In Review (CI/Fix)", HeaderReview, BadgeReview,
 		m.review, lastColWidth, colHeight, 2)
 
 	columns := lipgloss.JoinHorizontal(lipgloss.Top, queueCol, codingCol, reviewCol)
@@ -847,14 +1104,19 @@ func (m Model) View() string {
 	logBox := logBoxStyle.Width(logBoxWidth).Height(tuiLogBoxHeight).Render(logContent)
 
 	copyText := dimItemStyle.Render(
-		"[enter] detail  [a] timeline  [t] takeover  [f] rerun CI  [r] retry merge  [+/-] priority  [v/L] logs",
+		"[enter] detail  [a] timeline  [t] takeover  [f] rerun CI  [r] retry  [x/X] clean  [+/-] priority  [v/L] logs",
 	)
 	if m.logsCopied {
-		copyText = lipgloss.NewStyle().Foreground(lipgloss.Color(tuiColorSuccess)).Render("[Copied!]")
+		copyText = lipgloss.NewStyle().
+			Foreground(lipgloss.Color(tuiColorSuccess)).
+			Render("[Copied!]")
 	} else if m.actionFeedback != "" {
 		copyText = lipgloss.NewStyle().Foreground(lipgloss.Color(tuiColorSuccess)).Render(m.actionFeedback)
 	}
-	copyWidget := lipgloss.NewStyle().Width(m.width - tuiCopyWidgetMargin).Align(lipgloss.Right).Render(copyText)
+	copyWidget := lipgloss.NewStyle().
+		Width(m.width - tuiCopyWidgetMargin).
+		Align(lipgloss.Right).
+		Render(copyText)
 
 	statusLine := m.renderStatus()
 	if m.lastErr != nil {
@@ -942,7 +1204,9 @@ func (m Model) renderLoadingScreen() string {
 	sb.WriteString("\n\n")
 	sb.WriteString(punStyle.Render(pun))
 	sb.WriteString("\n\n")
-	sb.WriteString(subStyle.Render(fmt.Sprintf("Connecting to %s/%s  •  Press q to quit", m.owner, m.repo)))
+	sb.WriteString(
+		subStyle.Render(fmt.Sprintf("Connecting to %s/%s  •  Press q to quit", m.owner, m.repo)),
+	)
 	return sb.String()
 }
 
@@ -1020,7 +1284,20 @@ func (m Model) renderColumn(
 
 	linesUsed := 2
 	itemsRendered := 0
-	for i, s := range states {
+
+	startIndex := m.colOffsets[colIndex]
+	if startIndex >= len(states) {
+		startIndex = max(0, len(states)-1)
+	}
+
+	if startIndex > 0 {
+		sb.WriteString(dimItemStyle.Render(fmt.Sprintf("  ... %d more above", startIndex)))
+		sb.WriteString("\n")
+		linesUsed++
+	}
+
+	for i := startIndex; i < len(states); i++ {
+		s := states[i]
 		selected := colIndex == m.selectedCol && i == m.selectedRow
 		item, itemLines := m.renderItem(s, width, selected)
 		sb.WriteString(item)
@@ -1028,7 +1305,7 @@ func (m Model) renderColumn(
 		linesUsed += itemLines
 		itemsRendered++
 		if linesUsed >= height-2 {
-			remaining := len(states) - itemsRendered
+			remaining := len(states) - i - 1
 			if remaining > 0 {
 				sb.WriteString(dimItemStyle.Render(fmt.Sprintf("  ... %d more", remaining)))
 				sb.WriteString("\n")
@@ -1079,7 +1356,13 @@ func (m Model) renderItem(s *poller.State, colWidth int, selected bool) (string,
 	// colWidth is passed to lipgloss .Width() which includes padding (0,1).
 	// Item content fits in colWidth - 2 (1 padding each side), minus 1 safety buffer.
 	effectiveWidth := colWidth - 3
-	overhead := tuiItemLPad + lipgloss.Width(numStr) + 1 + lipgloss.Width(prStr) + lipgloss.Width(agePart)
+	overhead := tuiItemLPad + lipgloss.Width(
+		numStr,
+	) + 1 + lipgloss.Width(
+		prStr,
+	) + lipgloss.Width(
+		agePart,
+	)
 
 	spinnerStr := ""
 	if s.AgentStatus == "pending" {
@@ -1181,9 +1464,13 @@ func (m Model) RenderStatusSubLine(s *poller.State, colWidth int) string {
 	agentIcon := ""
 	switch s.AgentStatus {
 	case "success":
-		agentIcon = " " + lipgloss.NewStyle().Foreground(lipgloss.Color(tuiColorSuccess)).Render("[OK]")
+		agentIcon = " " + lipgloss.NewStyle().
+			Foreground(lipgloss.Color(tuiColorSuccess)).
+			Render("[OK]")
 	case "failed":
-		agentIcon = " " + lipgloss.NewStyle().Foreground(lipgloss.Color(tuiColorFailure)).Render("[X]")
+		agentIcon = " " + lipgloss.NewStyle().
+			Foreground(lipgloss.Color(tuiColorFailure)).
+			Render("[X]")
 	}
 
 	parts := []string{}
@@ -1255,7 +1542,10 @@ func (m Model) openLogFile(path string) (Model, tea.Cmd) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		m.actionFeedback = fmt.Sprintf("Cannot open log: %v", err)
-		return m, tea.Tick(tuiCopyFeedbackDuration, func(_ time.Time) tea.Msg { return clearActionMsg{} })
+		return m, tea.Tick(
+			tuiCopyFeedbackDuration,
+			func(_ time.Time) tea.Msg { return clearActionMsg{} },
+		)
 	}
 	lines := strings.Split(string(data), "\n")
 	// Keep only the last logViewerMaxLines lines.
@@ -1274,7 +1564,10 @@ func (m Model) openMergeLogCmd() (tea.Model, tea.Cmd) {
 	s := m.selectedState()
 	if s == nil || s.MergeLogPath == "" {
 		m.actionFeedback = "No merge log available for selected item"
-		return m, tea.Tick(tuiCopyFeedbackDuration, func(_ time.Time) tea.Msg { return clearActionMsg{} })
+		return m, tea.Tick(
+			tuiCopyFeedbackDuration,
+			func(_ time.Time) tea.Msg { return clearActionMsg{} },
+		)
 	}
 	m.mergeLogFilePath = s.MergeLogPath
 	m.mergeLogTailing = true
@@ -1341,7 +1634,10 @@ func (m Model) updateLogViewer(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		_ = clipboard.WriteAll(sb.String())
 		m.logsCopied = true
-		return m, tea.Tick(tuiCopyFeedbackDuration, func(_ time.Time) tea.Msg { return clearCopyMsg{} })
+		return m, tea.Tick(
+			tuiCopyFeedbackDuration,
+			func(_ time.Time) tea.Msg { return clearCopyMsg{} },
+		)
 	case "home", "g":
 		m.logViewerScroll = maxScroll
 		return m, nil
@@ -1380,20 +1676,31 @@ func (m Model) renderLogViewer() string {
 		scrollPos = fmt.Sprintf("  [ %d/%d ]", startIdx+1, total)
 	}
 
-	headerText := fmt.Sprintf(
-		" LOG VIEWER%s — %s%s  (scroll: up/down/pgup/pgdn  home/end: g/G  copy: c  close: L/v/esc/q) ",
-		map[bool]string{true: " [LIVE]", false: ""}[m.mergeLogTailing],
-		m.logViewerTitle,
-		scrollPos,
-	)
-	if m.logsCopied {
-		headerText = fmt.Sprintf(" LOG VIEWER%s — %s%s  [Copied!] ",
-			map[bool]string{true: " [LIVE]", false: ""}[m.mergeLogTailing],
-			m.logViewerTitle,
-			scrollPos,
-		)
+	var statusIndicator string
+	if m.mergeLogTailing {
+		statusIndicator = lipgloss.NewStyle().
+			Blink(true).
+			Bold(true).
+			Foreground(lipgloss.Color(tuiColorSpinner)).
+			Render("[ LIVE ]")
 	}
-	sb.WriteString(titleStyle.Width(m.width).Render(headerText))
+
+	headerLine1 := fmt.Sprintf(" LOG VIEWER %s — %s %s ", statusIndicator, m.logViewerTitle, scrollPos)
+	headerLine2 := " (scroll: up/down/pgup/pgdn  home/end: g/G  copy: c  close: L/v/esc/q) "
+
+	if m.logsCopied {
+		headerLine2 = "  [Copied!] "
+	}
+
+	cmdStyle := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(lipgloss.Color("#aaaaaa")).
+		Background(lipgloss.Color("#1a1a2e")).
+		Align(lipgloss.Center)
+
+	sb.WriteString(titleStyle.Width(m.width).Render(headerLine1))
+	sb.WriteString("\n")
+	sb.WriteString(cmdStyle.Width(m.width).Render(headerLine2))
 	sb.WriteString("\n")
 
 	innerW := max(m.width-2, tuiMinInnerWidth)

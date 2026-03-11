@@ -1,3 +1,4 @@
+//nolint:gocritic,goimports
 package poller_test
 
 import (
@@ -5,6 +6,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/BlackbirdWorks/copilot-autodev/agent"
 	"github.com/BlackbirdWorks/copilot-autodev/config"
 	"github.com/BlackbirdWorks/copilot-autodev/ghclient"
 	"github.com/BlackbirdWorks/copilot-autodev/poller"
@@ -28,7 +30,8 @@ func setupMockPoller(t *testing.T, handler http.HandlerFunc) *poller.Poller {
 	cfg.CopilotInvokeTimeoutSeconds = 60 // faster for tests
 
 	client := ghclient.NewWithTransport("test-token", cfg, rt)
-	return poller.New(cfg, client, "test-token")
+	ag := agent.NewCloudAgent(client)
+	return poller.New(cfg, client, "test-token", ag)
 }
 
 type fakeRoundTripper struct {

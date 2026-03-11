@@ -15,9 +15,11 @@ import (
 
 	"github.com/google/go-github/v68/github"
 
+	"github.com/BlackbirdWorks/copilot-autodev/agent"
 	"github.com/BlackbirdWorks/copilot-autodev/config"
 	"github.com/BlackbirdWorks/copilot-autodev/ghclient"
 	"github.com/BlackbirdWorks/copilot-autodev/pkgs/logger"
+	"github.com/BlackbirdWorks/copilot-autodev/resolver"
 )
 
 // IssueDisplayInfo holds the human-readable status for one issue, computed
@@ -51,6 +53,7 @@ type State struct {
 	RefinementCount int
 	RefinementMax   int
 	AgentStatus     string // "pending" | "success" | "failed"
+	AgentType       string // "cloud" | "cli" — recorded agent type for this issue
 	MergeLogPath    string // path to the per-PR merge resolution log (if any)
 	CICompleted     int    // number of completed CI workflow runs
 	CITotal         int    // total number of CI workflow runs
@@ -70,15 +73,16 @@ type Event struct {
 
 // Command is a request sent from the TUI (or other callers) to the Poller.
 type Command struct {
-	Action   string // "retry-merge" | "takeover" | "rerun-ci" | "priority-up" | "priority-down"
+	Action   string // "retry-merge" | "takeover" | "rerun-ci" | "priority-up" | "priority-down" | "retry-task" | "clean-workdir" | "clean-all"
 	PRNum    int    // the PR number to act on (used by retry-merge, rerun-ci)
-	IssueNum int    // the issue number to act on (used by takeover, priority-up/down)
+	IssueNum int    // the issue number to act on (used by takeover, priority-up/down, retry-task, clean-workdir)
 }
 
 // Poller orchestrates the Copilot workflow state machine.
 type Poller struct {
 	cfg            *config.Config
 	gh             *ghclient.Client
+	agent          agent.CodingAgent
 	token          string // GitHub PAT — used only for local git operations
 	Events         chan Event
 	Commands       chan Command
@@ -88,10 +92,11 @@ type Poller struct {
 }
 
 // New creates a Poller ready to Start.
-func New(cfg *config.Config, gh *ghclient.Client, token string) *Poller {
+func New(cfg *config.Config, gh *ghclient.Client, token string, ag agent.CodingAgent) *Poller {
 	return &Poller{
 		cfg:            cfg,
 		gh:             gh,
+		agent:          ag,
 		token:          token,
 		Events:         make(chan Event, 1),
 		Commands:       make(chan Command, 10),
@@ -121,20 +126,22 @@ func (p *Poller) Start(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case cmd := <-p.Commands:
-				p.handleCommand(ctx, cmd)
+				p.HandleCommand(ctx, cmd)
 			case <-ticker.C:
-				p.drainCommands(ctx)
+				p.DrainCommands(ctx)
 				p.Tick(ctx)
 			}
 		}
 	}()
 }
 
-// handleCommand processes a single TUI command.
-func (p *Poller) handleCommand(ctx context.Context, cmd Command) {
+// HandleCommand processes a single TUI command.
+func (p *Poller) HandleCommand(ctx context.Context, cmd Command) {
 	switch cmd.Action {
 	case "retry-merge":
 		p.retryMergeResolution(ctx, cmd.PRNum)
+	case "retry-task":
+		p.retryTask(ctx, cmd.IssueNum)
 	case "takeover":
 		p.takeoverIssue(ctx, cmd.IssueNum)
 	case "rerun-ci":
@@ -143,17 +150,44 @@ func (p *Poller) handleCommand(ctx context.Context, cmd Command) {
 		p.adjustPriority(ctx, cmd.IssueNum, 1)
 	case "priority-down":
 		p.adjustPriority(ctx, cmd.IssueNum, -1)
+	case "clean-workdir":
+		p.cleanWorkdir(ctx, cmd.IssueNum)
+	case "clean-all":
+		p.cleanAll(ctx)
 	default:
 		logger.Load(ctx).WarnContext(ctx, "unknown command", slog.String("action", cmd.Action))
 	}
 }
 
-// drainCommands processes any commands queued since the last tick.
-func (p *Poller) drainCommands(ctx context.Context) {
+// retryTask re-invokes the coding agent for an issue.
+func (p *Poller) retryTask(ctx context.Context, issueNum int) {
+	logger.Load(ctx).InfoContext(ctx, "retrying agent task", slog.Int("issue", issueNum))
+	if err := p.agent.RetryTask(ctx, issueNum); err != nil {
+		logger.Load(ctx).ErrorContext(ctx, "retry task failed",
+			slog.Int("issue", issueNum), slog.Any("err", err))
+	}
+}
+
+// cleanWorkdir removes the persistent working directory for a single issue.
+func (p *Poller) cleanWorkdir(ctx context.Context, issueNum int) {
+	logger.Load(ctx).InfoContext(ctx, "cleaning workdir", slog.Int("issue", issueNum))
+	p.agent.CleanupWorkdir(ctx, issueNum)
+}
+
+// cleanAll removes all persistent working directories and all merge logs.
+func (p *Poller) cleanAll(ctx context.Context) {
+	wdCount := p.agent.CleanupAllWorkdirs(ctx)
+	logCount := resolver.CleanupAllLogs()
+	logger.Load(ctx).InfoContext(ctx, "cleaned all workdirs and merge logs",
+		slog.Int("workdirs", wdCount), slog.Int("logs", logCount))
+}
+
+// DrainCommands processes any commands queued since the last tick.
+func (p *Poller) DrainCommands(ctx context.Context) {
 	for {
 		select {
 		case cmd := <-p.Commands:
-			p.handleCommand(ctx, cmd)
+			p.HandleCommand(ctx, cmd)
 		default:
 			return
 		}
@@ -219,13 +253,16 @@ func (p *Poller) adjustPriority(ctx context.Context, issueNum, delta int) {
 		delete(p.priorities, issueNum)
 	}
 	p.mu.Unlock()
-	logger.Load(ctx).InfoContext(ctx, "priority adjusted", slog.Int("issue", issueNum), slog.Int("priority", newPri))
+	logger.Load(ctx).
+		InfoContext(ctx, "priority adjusted", slog.Int("issue", issueNum), slog.Int("priority", newPri))
 }
 
 // FetchAllIssues returns the queue, coding, and reviewing issue lists fetched
 // from GitHub in a single concurrent batch — three parallel API calls instead
 // of the up-to-six sequential calls that the old per-phase fetch pattern used.
-func (p *Poller) FetchAllIssues(ctx context.Context) ([]*github.Issue, []*github.Issue, []*github.Issue, error) {
+func (p *Poller) FetchAllIssues(
+	ctx context.Context,
+) ([]*github.Issue, []*github.Issue, []*github.Issue, error) {
 	type result struct {
 		issues []*github.Issue
 		err    error
@@ -334,6 +371,14 @@ func (p *Poller) Tick(ctx context.Context) {
 		<-p.Events
 		p.Events <- evt
 	}
+
+	// Auto-cleanup old merge resolution logs.
+	if p.cfg.MergeLogRetentionMinutes > 0 {
+		retention := time.Duration(p.cfg.MergeLogRetentionMinutes) * time.Minute
+		if n := resolver.CleanupOldLogs(retention); n > 0 {
+			logger.Load(ctx).InfoContext(ctx, "cleaned up old merge logs", slog.Int("count", n))
+		}
+	}
 }
 
 // PromoteFromQueue moves issues from ai-queue → ai-coding up to the concurrency limit.
@@ -370,15 +415,16 @@ func (p *Poller) PromoteFromQueue(ctx context.Context, queue []*github.Issue) er
 			return err
 		}
 		prompt := FormatFallbackPrompt(p.cfg.FallbackIssueInvokePrompt, issue)
-		jobID, capiErr := p.gh.InvokeCopilotAgent(ctx, prompt, issue.GetTitle(), num, issue.GetHTMLURL())
+		jobID, capiErr := p.agent.InvokeTask(ctx, prompt, issue.GetTitle(), num, issue.GetHTMLURL())
 		if capiErr != nil {
 			logger.Load(ctx).ErrorContext(ctx, "could not invoke copilot agent",
 				slog.Int("issue", num), slog.Any("err", capiErr))
 		}
 
 		comment := fmt.Sprintf(
-			"copilot-autodev: agent task created for issue #%d (initial invoke).\n%s",
+			"copilot-autodev: agent task created for issue #%d (initial invoke).\n%s\n%s%s -->",
 			num, ghclient.CopilotNudgeCommentMarker,
+			ghclient.AgentTypeCommentMarker, p.cfg.AgentType,
 		)
 		if jobID != "" {
 			comment += fmt.Sprintf("\n%s%s -->", ghclient.CopilotJobIDCommentMarker, jobID)
@@ -400,7 +446,8 @@ func (p *Poller) ProcessCodingIssue(
 	num := issue.GetNumber()
 	pr, err := p.gh.OpenPRForIssue(ctx, issue)
 	if err != nil {
-		logger.Load(ctx).WarnContext(ctx, "could not look up PR", slog.Int("issue", num), slog.Any("err", err))
+		logger.Load(ctx).
+			WarnContext(ctx, "could not look up PR", slog.Int("issue", num), slog.Any("err", err))
 	}
 	if pr != nil {
 		if _, ok := displayInfo[num]; !ok {
@@ -439,7 +486,7 @@ func (p *Poller) ProcessCodingPR(
 ) error {
 	sha := pr.GetHead().GetSHA()
 	running, err := p.gh.AnyWorkflowRunActive(ctx, sha)
-	if err == nil && running {
+	if (err == nil && running) || p.IsAgentActive(ctx, num) {
 		label := "Agent finalizing code"
 		if p.gh.IsPRDraft(pr) {
 			label = "Copilot is writing code"
@@ -469,7 +516,8 @@ func (p *Poller) ProcessDraftPR(
 	if stop, err := t.HandleTimeout(ctx); err != nil || stop {
 		return err
 	}
-	logger.Load(ctx).InfoContext(ctx, "agent finished draft push; marking ready", slog.Int("pr", pr.GetNumber()))
+	logger.Load(ctx).
+		InfoContext(ctx, "agent finished draft push; marking ready", slog.Int("pr", pr.GetNumber()))
 	if err := p.gh.MarkPRReady(ctx, pr); err != nil {
 		logger.Load(ctx).
 			WarnContext(ctx, "could not mark PR as ready", slog.Int("pr", pr.GetNumber()), slog.Any("err", err))
@@ -551,6 +599,18 @@ func (p *Poller) NudgeSingleCodingIssue(
 		return nil
 	}
 
+	// Don't nudge with a different agent type than what originally started the task.
+	if stored := p.gh.ReadAgentType(ctx, num); stored != "" && stored != p.cfg.AgentType {
+		logger.Load(ctx).WarnContext(ctx, "agent type mismatch — letting current task finish",
+			slog.Int("issue", num), slog.String("stored", stored), slog.String("config", p.cfg.AgentType))
+		displayInfo[num] = &IssueDisplayInfo{
+			Current:     fmt.Sprintf("Started by %s agent — waiting", stored),
+			Next:        "Re-check next poll",
+			AgentStatus: "pending",
+		}
+		return nil
+	}
+
 	if p.IsAgentActive(ctx, num) {
 		displayInfo[num] = &IssueDisplayInfo{
 			Current:     "Agent actively running — waiting",
@@ -563,22 +623,9 @@ func (p *Poller) NudgeSingleCodingIssue(
 	return p.RequestNudge(ctx, issue, num, nudgeCount, timeout, displayInfo)
 }
 
-// IsAgentActive checks if any Copilot job or repository-level run is active.
+// IsAgentActive checks if the coding agent has any work in progress.
 func (p *Poller) IsAgentActive(ctx context.Context, num int) bool {
-	jobID, _ := p.gh.LatestCopilotJobID(ctx, num)
-	if jobID != "" {
-		status, err := p.gh.GetCopilotJobStatus(ctx, jobID)
-		if err == nil && status != nil {
-			s := status.Status
-			if s == "in_progress" || s == "running" || s == "queued" || s == "requested" || s == "pending" {
-				return true
-			}
-		}
-	}
-	if active, aErr := p.gh.HasActiveCopilotRun(ctx); aErr == nil && active {
-		return true
-	}
-	return false
+	return p.agent.IsActive(ctx, num)
 }
 
 // RequestNudge re-invokes the agent via CAPI.
@@ -599,16 +646,23 @@ func (p *Poller) RequestNudge(
 	}
 
 	nudgeBody := FormatFallbackPrompt(p.cfg.FallbackIssueInvokePrompt, issue)
-	jobID, invokeErr := p.gh.InvokeCopilotAgent(ctx, nudgeBody, issue.GetTitle(), num, issue.GetHTMLURL())
+	jobID, invokeErr := p.agent.InvokeTask(
+		ctx,
+		nudgeBody,
+		issue.GetTitle(),
+		num,
+		issue.GetHTMLURL(),
+	)
 	if invokeErr != nil {
 		logger.Load(ctx).
 			ErrorContext(ctx, "could not invoke copilot agent", slog.Int("issue", num), slog.Any("err", invokeErr))
 	}
 
 	comment := fmt.Sprintf(
-		"copilot-autodev: agent task created for issue #%d (attempt %d of %d).\n%s",
+		"copilot-autodev: agent task created for issue #%d (attempt %d of %d).\n%s\n%s%s -->",
 		num, nudgeCount+1, p.cfg.CopilotInvokeMaxRetries,
 		ghclient.CopilotNudgeCommentMarker,
+		ghclient.AgentTypeCommentMarker, p.cfg.AgentType,
 	)
 	if jobID != "" {
 		comment += fmt.Sprintf("\n%s%s -->", ghclient.CopilotJobIDCommentMarker, jobID)
@@ -616,21 +670,21 @@ func (p *Poller) RequestNudge(
 	return p.gh.PostComment(ctx, num, comment)
 }
 
-type agentTimeoutCfg struct {
-	countFn      func(ctx context.Context, prNum int) (int, error)
-	nudgeMarker  string
-	promptKind   string
-	noticeFormat string
-	statusVerb   string
+type AgentTimeoutCfg struct {
+	CountFn      func(ctx context.Context, prNum int) (int, error)
+	NudgeMarker  string
+	PromptKind   string
+	NoticeFormat string
+	StatusVerb   string
 }
 
-func (p *Poller) continueTimeoutCfg(promptKind, noticeFormat string) agentTimeoutCfg {
-	return agentTimeoutCfg{
-		countFn:      p.gh.CountAgentContinueComments,
-		nudgeMarker:  ghclient.AgentContinueCommentMarker,
-		statusVerb:   "retries",
-		promptKind:   promptKind,
-		noticeFormat: noticeFormat,
+func (p *Poller) continueTimeoutCfg(promptKind, noticeFormat string) AgentTimeoutCfg {
+	return AgentTimeoutCfg{
+		CountFn:      p.gh.CountAgentContinueComments,
+		NudgeMarker:  ghclient.AgentContinueCommentMarker,
+		StatusVerb:   "retries",
+		PromptKind:   promptKind,
+		NoticeFormat: noticeFormat,
 	}
 }
 
@@ -667,7 +721,7 @@ func (p *Poller) WaitForAgentCycle(
 	pr *github.PullRequest,
 	num int,
 	postedAt time.Time,
-	cfg agentTimeoutCfg,
+	cfg AgentTimeoutCfg,
 	current string,
 	displayInfo map[int]*IssueDisplayInfo,
 ) {
@@ -689,23 +743,32 @@ func (p *Poller) HandleAgentTimeout(
 	pr *github.PullRequest,
 	num int,
 	lastActivity time.Time,
-	cfg agentTimeoutCfg,
+	cfg AgentTimeoutCfg,
 	displayInfo map[int]*IssueDisplayInfo,
 ) bool {
 	if time.Since(lastActivity) <= time.Duration(p.cfg.CopilotInvokeTimeoutSeconds)*time.Second {
 		return false
 	}
-	continueCount, _ := cfg.countFn(ctx, pr.GetNumber())
+	continueCount, _ := cfg.CountFn(ctx, pr.GetNumber())
 	if continueCount >= p.cfg.MaxAgentContinueRetries {
-		_ = p.gh.PostComment(ctx, num, fmt.Sprintf(cfg.noticeFormat, continueCount))
+		_ = p.gh.PostComment(ctx, num, fmt.Sprintf(cfg.NoticeFormat, continueCount))
 		displayInfo[num] = &IssueDisplayInfo{
-			Current:     fmt.Sprintf("Agent unresponsive after %d %s — left in review", continueCount, cfg.statusVerb),
+			Current: fmt.Sprintf(
+				"Agent unresponsive after %d %s — left in review",
+				continueCount,
+				cfg.StatusVerb,
+			),
 			PR:          pr,
 			AgentStatus: "failed",
 		}
 		return true
 	}
-	_ = p.gh.PostComment(ctx, pr.GetNumber(), p.cfg.AgentContinuePrompt+"\n"+cfg.nudgeMarker)
+	_ = p.agent.SendPrompt(ctx, agent.PromptRequest{
+		PRNum:      pr.GetNumber(),
+		IssueNum:   num,
+		PromptType: "continue",
+		Body:       p.cfg.AgentContinuePrompt + "\n" + cfg.NudgeMarker,
+	})
 	return false
 }
 
@@ -734,7 +797,11 @@ func (p *Poller) HandleMissingPR(
 	return p.gh.SwapLabel(ctx, num, p.cfg.LabelReview, p.cfg.LabelCoding)
 }
 
-func (p *Poller) ProcessOne(ctx context.Context, issue *github.Issue, displayInfo map[int]*IssueDisplayInfo) error {
+func (p *Poller) ProcessOne(
+	ctx context.Context,
+	issue *github.Issue,
+	displayInfo map[int]*IssueDisplayInfo,
+) error {
 	pr, err := p.gh.OpenPRForIssue(ctx, issue)
 	if err != nil {
 		return err
@@ -770,7 +837,7 @@ func (p *Poller) BuildRefinementCIPrompt(
 	var sb strings.Builder
 	fmt.Fprintf(
 		&sb,
-		"@copilot (refinement check %d of %d against issue #%d). %s Please address any review feedback.",
+		"(refinement check %d of %d against issue #%d). %s Please address any review feedback.",
 		round,
 		maxRounds,
 		issueNum,
@@ -808,7 +875,10 @@ func BuildCIFailureSection(workflowName string, failedJobs []ghclient.FailedJobI
 	return sb.String()
 }
 
-func (p *Poller) Snapshot(ctx context.Context, displayInfo map[int]*IssueDisplayInfo) ([]*State, []*State, []*State) {
+func (p *Poller) Snapshot(
+	ctx context.Context,
+	displayInfo map[int]*IssueDisplayInfo,
+) ([]*State, []*State, []*State) {
 	queueIssues, _ := p.gh.IssuesByLabel(ctx, p.cfg.LabelQueue)
 	codingIssues, _ := p.gh.IssuesByLabel(ctx, p.cfg.LabelCoding)
 	reviewIssues, _ := p.gh.IssuesByLabel(ctx, p.cfg.LabelReview)
@@ -820,7 +890,7 @@ func (p *Poller) Snapshot(ctx context.Context, displayInfo map[int]*IssueDisplay
 	toStates := func(issues []*github.Issue, status string) []*State {
 		states := make([]*State, 0, len(issues))
 		for _, i := range issues {
-			s := &State{Issue: i, Status: status}
+			s := &State{Issue: i, Status: status, AgentType: p.cfg.AgentType}
 			if status == "queue" {
 				s.CurrentStatus = "Waiting to be assigned"
 				s.NextAction = "Assign Copilot"
@@ -838,15 +908,32 @@ func (p *Poller) Snapshot(ctx context.Context, displayInfo map[int]*IssueDisplay
 				s.CIPassed = info.CIPassed
 				s.CIFailed = info.CIFailed
 			}
+			// Read the stored agent type from GitHub comments if available.
+			if status != "queue" {
+				if stored := p.gh.ReadAgentType(ctx, i.GetNumber()); stored != "" {
+					s.AgentType = stored
+				}
+			}
 			states = append(states, s)
 		}
 		return states
 	}
 
-	return toStates(queueIssues, "queue"), toStates(codingIssues, "coding"), toStates(reviewIssues, "review")
+	return toStates(
+			queueIssues,
+			"queue",
+		), toStates(
+			codingIssues,
+			"coding",
+		), toStates(
+			reviewIssues,
+			"review",
+		)
 }
 
-func DeduplicateIssueLists(queue, coding, reviewing []*github.Issue) ([]*github.Issue, []*github.Issue) {
+func DeduplicateIssueLists(
+	queue, coding, reviewing []*github.Issue,
+) ([]*github.Issue, []*github.Issue) {
 	seen := make(map[int]struct{}, len(reviewing)+len(queue))
 	for _, i := range reviewing {
 		seen[i.GetNumber()] = struct{}{}

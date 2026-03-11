@@ -23,6 +23,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/gen2brain/beeep"
 
+	"github.com/BlackbirdWorks/copilot-autodev/agent"
 	"github.com/BlackbirdWorks/copilot-autodev/config"
 	"github.com/BlackbirdWorks/copilot-autodev/ghclient"
 	"github.com/BlackbirdWorks/copilot-autodev/pkgs/logger"
@@ -65,6 +66,7 @@ func (w *logWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+//nolint:funlen
 func main() {
 	bootstrapLogger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 
@@ -85,11 +87,28 @@ func main() {
 
 	gh := ghclient.New(token, cfg)
 
+	// Create the coding agent backend based on config.
+	var ag agent.CodingAgent
+	switch cfg.AgentType {
+	case "cli":
+		ag = agent.NewCLIAgent(gh, cfg, token)
+		bootstrapLogger.Info("using CLI agent backend", slog.String("cmd", cfg.CLIAgentCmd))
+	default:
+		ag = agent.NewCloudAgent(gh)
+	}
+
 	// Create and start the background poller.
-	p := poller.New(cfg, gh, token)
+	p := poller.New(cfg, gh, token, ag)
 
 	// Create the Bubble Tea model with the poller's command channel.
-	model := tui.New(cfg.GitHubOwner, cfg.GitHubRepo, cfg.PollIntervalSeconds, p.Commands, gh)
+	model := tui.New(
+		cfg.GitHubOwner,
+		cfg.GitHubRepo,
+		cfg.PollIntervalSeconds,
+		p.Commands,
+		gh,
+		cfg.AgentType,
+	)
 
 	prog := tea.NewProgram(
 		model,
@@ -191,7 +210,7 @@ func main() {
 	if _, err := prog.Run(); err != nil {
 		cancel()
 		fmt.Fprintf(os.Stderr, "error running TUI: %v\n", err)
-		os.Exit(1)
+		os.Exit(1) //nolint:gocritic
 	}
 	cancel()
 }

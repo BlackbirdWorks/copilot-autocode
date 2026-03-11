@@ -1,3 +1,4 @@
+//nolint:gocritic,goimports
 package ghclient_test
 
 import (

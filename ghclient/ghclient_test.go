@@ -1,3 +1,4 @@
+//nolint:gocritic,goimports
 package ghclient_test
 
 import (
@@ -205,7 +206,10 @@ func TestTimeAgo(t *testing.T) {
 	}
 }
 
-func setupMockAPI(t *testing.T, handler func(*http.Request) (*http.Response, error)) *ghclient.Client {
+func setupMockAPI(
+	t *testing.T,
+	handler func(*http.Request) (*http.Response, error),
+) *ghclient.Client {
 	t.Helper()
 	rt := &fakeRoundTripper{handler: handler}
 	cfg := &config.Config{
@@ -530,7 +534,10 @@ func TestApprovePendingDeployments(t *testing.T) {
 		{
 			name: "one approvable environment",
 			pending: []map[string]any{
-				{"environment": map[string]any{"id": 10, "name": "production"}, "current_user_can_approve": true},
+				{
+					"environment":              map[string]any{"id": 10, "name": "production"},
+					"current_user_can_approve": true,
+				},
 			},
 			wantApproved: 1,
 			wantPostBody: true,
@@ -538,7 +545,10 @@ func TestApprovePendingDeployments(t *testing.T) {
 		{
 			name: "not approvable by current user",
 			pending: []map[string]any{
-				{"environment": map[string]any{"id": 20, "name": "production"}, "current_user_can_approve": false},
+				{
+					"environment":              map[string]any{"id": 20, "name": "production"},
+					"current_user_can_approve": false,
+				},
 			},
 			wantApproved: 0,
 			wantPostBody: false,
@@ -546,8 +556,14 @@ func TestApprovePendingDeployments(t *testing.T) {
 		{
 			name: "mixed: only approvable ones submitted",
 			pending: []map[string]any{
-				{"environment": map[string]any{"id": 10, "name": "staging"}, "current_user_can_approve": true},
-				{"environment": map[string]any{"id": 20, "name": "prod"}, "current_user_can_approve": false},
+				{
+					"environment":              map[string]any{"id": 10, "name": "staging"},
+					"current_user_can_approve": true,
+				},
+				{
+					"environment":              map[string]any{"id": 20, "name": "prod"},
+					"current_user_can_approve": false,
+				},
 			},
 			wantApproved: 1,
 			wantPostBody: true,
@@ -673,23 +689,51 @@ func TestPRRegexMatching(t *testing.T) {
 
 	// Body match tests
 	assert.True(t, bodyRe.MatchString("Fixes #329"), "bodyRe should match exact string")
-	assert.True(t, bodyRe.MatchString("Addresses #329\nWith more text"), "bodyRe should match loosened mention")
+	assert.True(
+		t,
+		bodyRe.MatchString("Addresses #329\nWith more text"),
+		"bodyRe should match loosened mention",
+	)
 	assert.False(t, bodyRe.MatchString("Fixes #3291"), "bodyRe should NOT match #3291")
 
 	// Title match tests
-	assert.True(t, titleRe.MatchString("#329 Fix database bug"), "titleRe should match starting number")
+	assert.True(
+		t,
+		titleRe.MatchString("#329 Fix database bug"),
+		"titleRe should match starting number",
+	)
 	assert.True(t, titleRe.MatchString("API Fixes for #329"), "titleRe should match ending number")
 	assert.False(t, titleRe.MatchString("Fixes #3295"), "titleRe should NOT match #3295")
 
 	// Branch match tests
 	assert.True(t, branchRe.MatchString("issue-329"), "branchRe should match basic issue branch")
-	assert.True(t, branchRe.MatchString("copilot/issue-329-fix-bug"), "branchRe should match copilot prefixed branch")
-	assert.True(t, branchRe.MatchString("issue329"), "branchRe should match unhyphenated issue branch")
-	assert.True(t, branchRe.MatchString("copilot/329-fix-bug"), "branchRe should match bare number after slash")
+	assert.True(
+		t,
+		branchRe.MatchString("copilot/issue-329-fix-bug"),
+		"branchRe should match copilot prefixed branch",
+	)
+	assert.True(
+		t,
+		branchRe.MatchString("issue329"),
+		"branchRe should match unhyphenated issue branch",
+	)
+	assert.True(
+		t,
+		branchRe.MatchString("copilot/329-fix-bug"),
+		"branchRe should match bare number after slash",
+	)
 	assert.True(t, branchRe.MatchString("copilot-swe-agent/issue-329/fix-bug"),
 		"branchRe should match slash after number")
-	assert.False(t, branchRe.MatchString("issue-3295-fix"), "branchRe should NOT match issue branch with extra digits")
-	assert.False(t, branchRe.MatchString("issue-3295/fix"), "branchRe should NOT match wrong issue with slash")
+	assert.False(
+		t,
+		branchRe.MatchString("issue-3295-fix"),
+		"branchRe should NOT match issue branch with extra digits",
+	)
+	assert.False(
+		t,
+		branchRe.MatchString("issue-3295/fix"),
+		"branchRe should NOT match wrong issue with slash",
+	)
 }
 
 // TestGetCopilotJobStatus verifies polling the job status endpoint.
@@ -751,12 +795,14 @@ func TestGetCopilotJobStatus(t *testing.T) {
 			// but doesn't expose its URL on the returned ghclient object directly.
 			// Let's just create our own server so we can pass its URL to GetJobStatusAt.
 
-			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				assert.Equal(t, http.MethodGet, r.Method)
-				assert.Contains(t, r.URL.Path, tc.jobID)
-				w.WriteHeader(tc.serverStatus)
-				_, _ = w.Write([]byte(tc.serverBody))
-			}))
+			srv := httptest.NewServer(
+				http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					assert.Equal(t, http.MethodGet, r.Method)
+					assert.Contains(t, r.URL.Path, tc.jobID)
+					w.WriteHeader(tc.serverStatus)
+					_, _ = w.Write([]byte(tc.serverBody))
+				}),
+			)
 			defer srv.Close()
 
 			client := ghclient.NewTestClient("test-owner", "test-repo", "test-token")
@@ -817,11 +863,15 @@ func TestLatestCopilotJobID(t *testing.T) {
 			name: "multiple markers returns latest",
 			comments: []*github.IssueComment{
 				{
-					Body:      github.Ptr(fmt.Sprintf("Old task.\n%sold-job -->", ghclient.CopilotJobIDCommentMarker)),
+					Body: github.Ptr(
+						fmt.Sprintf("Old task.\n%sold-job -->", ghclient.CopilotJobIDCommentMarker),
+					),
 					CreatedAt: &github.Timestamp{Time: time.Now().Add(-1 * time.Hour)},
 				},
 				{
-					Body:      github.Ptr(fmt.Sprintf("New task.\n%snew-job -->", ghclient.CopilotJobIDCommentMarker)),
+					Body: github.Ptr(
+						fmt.Sprintf("New task.\n%snew-job -->", ghclient.CopilotJobIDCommentMarker),
+					),
 					CreatedAt: &github.Timestamp{Time: time.Now()},
 				},
 			},
@@ -894,7 +944,8 @@ func TestCloseIssue(t *testing.T) {
 		assert.NoError(t, json.NewDecoder(r.Body).Decode(&req))
 		assert.Equal(t, "closed", *req.State)
 		w.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(w).Encode(&github.Issue{Number: github.Ptr(123), State: github.Ptr("closed")})
+		_ = json.NewEncoder(w).
+			Encode(&github.Issue{Number: github.Ptr(123), State: github.Ptr("closed")})
 	})
 	err := c.CloseIssue(t.Context(), 123)
 	require.NoError(t, err)
@@ -915,7 +966,8 @@ func TestOpenPRForIssue(t *testing.T) {
 					{Body: github.Ptr(fmt.Sprintf("<!-- copilot-autodev:pr-link:%d -->", 456))},
 				})
 			case strings.Contains(r.URL.Path, "/pulls/456"):
-				_ = json.NewEncoder(w).Encode(&github.PullRequest{Number: github.Ptr(456), State: github.Ptr("open")})
+				_ = json.NewEncoder(w).
+					Encode(&github.PullRequest{Number: github.Ptr(456), State: github.Ptr("open")})
 			case r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/labels"):
 				w.WriteHeader(http.StatusOK) // ensureTwoWayLink
 			}
@@ -936,7 +988,8 @@ func TestOpenPRForIssue(t *testing.T) {
 					{Body: github.Ptr("<!-- copilot-autodev:job-id:job-test -->")},
 				})
 			case strings.Contains(r.URL.Path, "/pulls/789"):
-				_ = json.NewEncoder(w).Encode(&github.PullRequest{Number: github.Ptr(789), State: github.Ptr("open")})
+				_ = json.NewEncoder(w).
+					Encode(&github.PullRequest{Number: github.Ptr(789), State: github.Ptr("open")})
 			case r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/labels"):
 				w.WriteHeader(http.StatusOK)
 			}
@@ -959,7 +1012,8 @@ func TestOpenPRForIssue(t *testing.T) {
 					})
 				}
 			case strings.Contains(r.URL.Path, "/pulls/202"):
-				_ = json.NewEncoder(w).Encode(&github.PullRequest{Number: github.Ptr(202), State: github.Ptr("open")})
+				_ = json.NewEncoder(w).
+					Encode(&github.PullRequest{Number: github.Ptr(202), State: github.Ptr("open")})
 			case r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/labels"):
 				w.WriteHeader(http.StatusOK)
 			}
@@ -1013,7 +1067,8 @@ func TestOpenPRForIssue(t *testing.T) {
 				}
 				_ = json.NewEncoder(w).Encode(resp)
 			case strings.Contains(r.URL.Path, "/pulls/505"):
-				_ = json.NewEncoder(w).Encode(&github.PullRequest{Number: github.Ptr(505), State: github.Ptr("open")})
+				_ = json.NewEncoder(w).
+					Encode(&github.PullRequest{Number: github.Ptr(505), State: github.Ptr("open")})
 			case r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/labels"):
 				w.WriteHeader(http.StatusOK)
 			}
@@ -1103,8 +1158,14 @@ func TestOpenPRForIssue(t *testing.T) {
 			if strings.Contains(r.URL.Path, "/search/issues") {
 				_ = json.NewEncoder(w).Encode(&github.IssuesSearchResult{
 					Issues: []*github.Issue{
-						{Number: github.Ptr(999), PullRequestLinks: &github.PullRequestLinks{URL: github.Ptr("url")}},
-						{Number: github.Ptr(505), PullRequestLinks: &github.PullRequestLinks{URL: github.Ptr("url")}},
+						{
+							Number:           github.Ptr(999),
+							PullRequestLinks: &github.PullRequestLinks{URL: github.Ptr("url")},
+						},
+						{
+							Number:           github.Ptr(505),
+							PullRequestLinks: &github.PullRequestLinks{URL: github.Ptr("url")},
+						},
 					},
 				})
 			} else if strings.Contains(r.URL.Path, "/pulls/999") {
@@ -1320,7 +1381,10 @@ func TestCountNudgesSince(t *testing.T) {
 	t.Parallel()
 	c := setupMockGitHubAPI(t, func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode([]*github.IssueComment{
-			{Body: github.Ptr("<!-- copilot-autodev:nudge -->"), CreatedAt: &github.Timestamp{Time: time.Now()}},
+			{
+				Body:      github.Ptr("<!-- copilot-autodev:nudge -->"),
+				CreatedAt: &github.Timestamp{Time: time.Now()},
+			},
 		})
 	})
 	got, err := c.CountNudgesSince(t.Context(), 123, time.Now().Add(-1*time.Hour))
@@ -1333,7 +1397,10 @@ func TestLastNudgeAt(t *testing.T) {
 	now := time.Now()
 	c := setupMockGitHubAPI(t, func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode([]*github.IssueComment{
-			{Body: github.Ptr("<!-- copilot-autodev:nudge -->"), CreatedAt: &github.Timestamp{Time: now}},
+			{
+				Body:      github.Ptr("<!-- copilot-autodev:nudge -->"),
+				CreatedAt: &github.Timestamp{Time: now},
+			},
 		})
 	})
 	got, err := c.LastNudgeAt(t.Context(), 123)
@@ -1513,7 +1580,11 @@ func TestFailedRunDetails(t *testing.T) {
 		if strings.Contains(r.URL.Path, "/actions/runs") && !strings.Contains(r.URL.Path, "/jobs") {
 			_ = json.NewEncoder(w).Encode(&github.WorkflowRuns{
 				WorkflowRuns: []*github.WorkflowRun{
-					{ID: github.Ptr(int64(101)), Name: github.Ptr("test-workflow"), Conclusion: github.Ptr("failure")},
+					{
+						ID:         github.Ptr(int64(101)),
+						Name:       github.Ptr("test-workflow"),
+						Conclusion: github.Ptr("failure"),
+					},
 				},
 			})
 		} else if strings.Contains(r.URL.Path, "/jobs") {
@@ -1568,7 +1639,10 @@ func TestContinueComments(t *testing.T) {
 	now := time.Now()
 	c := setupMockGitHubAPI(t, func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode([]*github.IssueComment{
-			{Body: github.Ptr("<!-- copilot-autodev:agent-continue -->"), CreatedAt: &github.Timestamp{Time: now}},
+			{
+				Body:      github.Ptr("<!-- copilot-autodev:agent-continue -->"),
+				CreatedAt: &github.Timestamp{Time: now},
+			},
 			{
 				Body:      github.Ptr("<!-- copilot-autodev:merge-conflict-continue -->"),
 				CreatedAt: &github.Timestamp{Time: now},
@@ -1613,59 +1687,113 @@ func TestPostReviewComment(t *testing.T) {
 
 func TestCountPrompts(t *testing.T) {
 	t.Parallel()
-	c := setupMockGitHubAPI(t, func(w http.ResponseWriter, r *http.Request) {
-		if strings.Contains(r.URL.Path, "/reviews") {
-			_ = json.NewEncoder(w).
-				Encode([]*github.PullRequestReview{{Body: github.Ptr("<!-- copilot-autodev:refinement -->")}})
-		} else {
-			_ = json.NewEncoder(w).
-				Encode([]*github.IssueComment{{Body: github.Ptr("<!-- copilot-autodev:merge-conflict -->")}})
-		}
-	})
-	count, err := c.CountRefinementPromptsSent(t.Context(), 123)
-	require.NoError(t, err)
-	assert.Equal(t, 1, count)
+	type args struct{}
+	type wants struct {
+		count1 int
+		count2 int
+	}
+	tests := []struct {
+		name  string
+		args  args
+		wants wants
+	}{
+		{
+			name:  "count prompts",
+			args:  args{},
+			wants: wants{count1: 1, count2: 1},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			c := setupMockGitHubAPI(t, func(w http.ResponseWriter, r *http.Request) {
+				if strings.Contains(r.URL.Path, "/reviews") {
+					_ = json.NewEncoder(w).
+						Encode([]*github.PullRequestReview{{Body: github.Ptr("<!-- copilot-autodev:refinement -->")}})
+				} else {
+					_ = json.NewEncoder(w).
+						Encode([]*github.IssueComment{{Body: github.Ptr("<!-- copilot-autodev:merge-conflict -->")}})
+				}
+			})
+			count, err := c.CountRefinementPromptsSent(t.Context(), 123)
+			require.NoError(t, err)
+			assert.Equal(t, tt.wants.count1, count)
 
-	count, err = c.CountMergeConflictAttempts(t.Context(), 123)
-	require.NoError(t, err)
-	assert.Equal(t, 1, count)
+			count, err = c.CountMergeConflictAttempts(t.Context(), 123)
+			require.NoError(t, err)
+			assert.Equal(t, tt.wants.count2, count)
+		})
+	}
 }
 
 func TestPRManagement(t *testing.T) {
 	t.Parallel()
-	c := setupMockGitHubAPI(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPut && strings.Contains(r.URL.Path, "/merge") {
-			_ = json.NewEncoder(w).Encode(&github.PullRequestMergeResult{Merged: github.Ptr(true)})
-		} else if r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/reviews") {
-			w.WriteHeader(http.StatusOK)
-		}
-	})
-	err := c.ApprovePR(t.Context(), 123)
-	require.NoError(t, err)
+	type args struct {
+		prNum int
+	}
+	type wants struct {
+		errNil bool
+	}
+	tests := []struct {
+		name  string
+		args  args
+		wants wants
+	}{
+		{
+			name:  "manage pr",
+			args:  args{prNum: 123},
+			wants: wants{errNil: true},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			c := setupMockGitHubAPI(t, func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodPut && strings.Contains(r.URL.Path, "/merge") {
+					_ = json.NewEncoder(w).
+						Encode(&github.PullRequestMergeResult{Merged: github.Ptr(true)})
+				} else if r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/reviews") {
+					w.WriteHeader(http.StatusOK)
+				}
+			})
+			err := c.ApprovePR(t.Context(), tt.args.prNum)
+			if tt.wants.errNil {
+				require.NoError(t, err)
+			}
 
-	pr := &github.PullRequest{Number: github.Ptr(123)}
-	err = c.MergePR(t.Context(), pr)
-	require.NoError(t, err)
+			pr := &github.PullRequest{Number: github.Ptr(tt.args.prNum)}
+			err = c.MergePR(t.Context(), pr)
+			if tt.wants.errNil {
+				require.NoError(t, err)
+			}
+		})
+	}
 }
 
 func TestRemoveLabel(t *testing.T) {
 	t.Parallel()
-	tests := []struct {
-		name    string
-		status  int
-		wantErr bool
-	}{
-		{"success", http.StatusNoContent, false},
-		{"error", http.StatusInternalServerError, true},
+	type args struct {
+		status int
 	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
+	type wants struct {
+		wantErr bool
+	}
+	tests := []struct {
+		name  string
+		args  args
+		wants wants
+	}{
+		{"success", args{status: http.StatusNoContent}, wants{wantErr: false}},
+		{"error", args{status: http.StatusInternalServerError}, wants{wantErr: true}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			c := setupMockGitHubAPI(t, func(w http.ResponseWriter, r *http.Request) {
-				w.WriteHeader(tc.status)
+				w.WriteHeader(tt.args.status)
 			})
 			err := c.RemoveLabel(t.Context(), 123, "bug")
-			if tc.wantErr {
+			if tt.wants.wantErr {
 				require.Error(t, err)
 			} else {
 				require.NoError(t, err)
@@ -1676,20 +1804,27 @@ func TestRemoveLabel(t *testing.T) {
 func TestLatestWorkflowRun_Caching(t *testing.T) {
 	t.Parallel()
 
-	tests := []struct {
-		name      string
-		shas      []string
+	type args struct {
+		shas []string
+	}
+	type wants struct {
 		wantCalls int
+	}
+
+	tests := []struct {
+		name  string
+		args  args
+		wants wants
 	}{
 		{
-			name:      "cache hit – same SHA twice",
-			shas:      []string{"sha1", "sha1"},
-			wantCalls: 1,
+			name:  "cache hit – same SHA twice",
+			args:  args{shas: []string{"sha1", "sha1"}},
+			wants: wants{wantCalls: 1},
 		},
 		{
-			name:      "cache miss – different SHAs",
-			shas:      []string{"sha1", "sha2"},
-			wantCalls: 2,
+			name:  "cache miss – different SHAs",
+			args:  args{shas: []string{"sha1", "sha2"}},
+			wants: wants{wantCalls: 2},
 		},
 	}
 
@@ -1706,12 +1841,93 @@ func TestLatestWorkflowRun_Caching(t *testing.T) {
 				_ = json.NewEncoder(w).Encode(resp)
 			})
 
-			for _, sha := range tt.shas {
+			for _, sha := range tt.args.shas {
 				_, err := c.LatestWorkflowRun(t.Context(), sha)
 				require.NoError(t, err)
 			}
 
-			assert.Equal(t, tt.wantCalls, callCount)
+			assert.Equal(t, tt.wants.wantCalls, callCount)
+		})
+	}
+}
+
+func TestHasAgentCommentSince(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+	type args struct {
+		comments []*github.IssueComment
+		since    time.Time
+	}
+	type wants struct {
+		want bool
+	}
+	tests := []struct {
+		name  string
+		args  args
+		wants wants
+	}{
+		{
+			name: "agent comment exists",
+			args: args{
+				comments: []*github.IssueComment{
+					{
+						Body:      github.Ptr("Fixed"),
+						CreatedAt: &github.Timestamp{Time: now.Add(1 * time.Minute)},
+						User:      &github.User{Login: github.Ptr("copilot[bot]")},
+					},
+				},
+				since: now,
+			},
+			wants: wants{want: true},
+		},
+		{
+			name: "agent comment too old",
+			args: args{
+				comments: []*github.IssueComment{
+					{
+						Body:      github.Ptr("Fixed"),
+						CreatedAt: &github.Timestamp{Time: now.Add(-1 * time.Minute)},
+						User:      &github.User{Login: github.Ptr("copilot[bot]")},
+					},
+				},
+				since: now,
+			},
+			wants: wants{want: false},
+		},
+		{
+			name: "no comments",
+			args: args{
+				comments: []*github.IssueComment{},
+				since:    now,
+			},
+			wants: wants{want: false},
+		},
+		{
+			name: "orchestrator comment (should be ignored)",
+			args: args{
+				comments: []*github.IssueComment{
+					{
+						Body:      github.Ptr("Fixed"),
+						CreatedAt: &github.Timestamp{Time: now.Add(1 * time.Minute)},
+						User:      &github.User{Login: github.Ptr("copilot-autodev")},
+					},
+				},
+				since: now,
+			},
+			wants: wants{want: false},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			c := setupMockGitHubAPI(t, func(w http.ResponseWriter, r *http.Request) {
+				_ = json.NewEncoder(w).Encode(tt.args.comments)
+			})
+
+			got, err := c.HasAgentCommentSince(t.Context(), 1, tt.args.since)
+			require.NoError(t, err)
+			assert.Equal(t, tt.wants.want, got)
 		})
 	}
 }

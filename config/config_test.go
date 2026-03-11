@@ -1,3 +1,4 @@
+//nolint:gocritic,goimports
 package config_test
 
 import (
