@@ -156,9 +156,11 @@ func New(token string, cfg *config.Config) *Client {
 func NewWithTransport(token string, cfg *config.Config, transport http.RoundTripper) *Client {
 	ts := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: token})
 	ctx := context.Background()
-	if transport != nil {
-		ctx = context.WithValue(ctx, oauth2.HTTPClient, &http.Client{Transport: transport})
+	if transport == nil {
+		transport = http.DefaultTransport
 	}
+	transport = NewRetryRoundTripper(transport, 3)
+	ctx = context.WithValue(ctx, oauth2.HTTPClient, &http.Client{Transport: transport})
 	tc := oauth2.NewClient(ctx, ts)
 	return &Client{
 		gh:            github.NewClient(tc),
@@ -382,7 +384,7 @@ func (c *Client) OpenPRForIssue(
 		c.ensureTwoWayLink(ctx, issueNum, pr.GetNumber())
 		return pr, nil
 	} else if err != nil {
-		logger.Load(ctx).ErrorContext(ctx, "issue step 6 error", slog.Int("issue", issueNum), slog.Any("err", err))
+		logger.Load(ctx).WarnContext(ctx, "issue step 6 warning (continuing)", slog.Int("issue", issueNum), slog.Any("err", err))
 	}
 
 	logger.Load(ctx).InfoContext(ctx, "OpenPRForIssue: no PR found after all 6 detection steps",
@@ -397,8 +399,8 @@ func (c *Client) findPRByIssueComment(
 	linkedPRNum, err := c.FindLinkedPRFromComments(ctx, issueNum)
 	if err != nil {
 		logger.Load(ctx).
-			ErrorContext(ctx, "issue step 1 error", slog.Int("issue", issueNum), slog.Any("err", err))
-		return nil, err
+			WarnContext(ctx, "issue step 1 warning (continuing)", slog.Int("issue", issueNum), slog.Any("err", err))
+		return nil, nil // Return nil, nil to indicate no PR found via this step but no fatal error
 	}
 	if linkedPRNum == 0 {
 		return nil, nil
@@ -851,19 +853,21 @@ func (c *Client) AnyWorkflowRunActive(ctx context.Context, sha string) (bool, er
 	return false, nil
 }
 
-// HasActiveCopilotRun checks whether there are any in-progress or queued
-// workflow runs in the repository that appear to be from the Copilot coding
-// agent.  It matches runs whose triggering actor login contains "copilot"
+// HasActiveCopilotRunForBranch checks whether there are any in-progress or queued
+// workflow runs associated with the Copilot agent on the given branch.
+// It matches runs whose triggering actor login contains "copilot"
 // (case-insensitive) or whose workflow name contains "copilot".
 //
-// This is used as a guard before re-invoking the agent: if a Copilot run
-// is already active, we skip re-invocation to avoid duplicate tasks.
-func (c *Client) HasActiveCopilotRun(ctx context.Context) (bool, error) {
+// This is used as a guard before re-invoking the agent or resolving conflicts
+// locally: if a Copilot run is already active on this branch, we skip to avoid
+// race conditions.
+func (c *Client) HasActiveCopilotRunForBranch(ctx context.Context, branch string) (bool, error) {
 	runs, _, err := c.gh.Actions.ListRepositoryWorkflowRuns(
 		ctx,
 		c.owner,
 		c.repo,
 		&github.ListWorkflowRunsOptions{
+			Branch:      branch,
 			ListOptions: github.ListOptions{PerPage: perPageSmall},
 		},
 	)
@@ -1805,8 +1809,8 @@ func (c *Client) HasCommentContaining(
 	return false, time.Time{}, nil
 }
 
-// DeleteCommentContaining finds the first comment on an issue/PR whose body
-// contains needle and deletes it.  Returns nil if no matching comment exists.
+// DeleteCommentContaining finds all comments on an issue/PR whose body
+// contains needle and deletes them. Returns nil if no matching comments exist.
 func (c *Client) DeleteCommentContaining(ctx context.Context, num int, needle string) error {
 	opts := &github.IssueListCommentsOptions{
 		ListOptions: github.ListOptions{PerPage: perPageDefault},
@@ -1818,8 +1822,9 @@ func (c *Client) DeleteCommentContaining(ctx context.Context, num int, needle st
 		}
 		for _, cm := range comments {
 			if strings.Contains(cm.GetBody(), needle) {
-				_, err := c.gh.Issues.DeleteComment(ctx, c.owner, c.repo, cm.GetID())
-				return err
+				if _, err := c.gh.Issues.DeleteComment(ctx, c.owner, c.repo, cm.GetID()); err != nil {
+					return err
+				}
 			}
 		}
 		if resp.NextPage == 0 {

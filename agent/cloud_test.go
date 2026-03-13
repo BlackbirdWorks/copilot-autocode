@@ -77,7 +77,7 @@ func TestCloudAgent_IsActive(t *testing.T) {
 			client := ghclient.NewWithTransport("token", cfg, rt)
 			ag := agent.NewCloudAgent(client)
 
-			assert.Equal(t, tt.expected, ag.IsActive(ctx, 123))
+			assert.Equal(t, tt.expected, ag.IsActive(ctx, 123, "branch"))
 		})
 	}
 }

@@ -89,6 +89,18 @@ func (t *PRTask) SyncBranch(ctx context.Context) (bool, error) {
 		return true, nil
 	}
 
+	// Double check the agent is completely idle (CAPI + Actions) before we
+	// fall through to local AI resolution.
+	if t.P.IsAgentActive(ctx, t.Num, t.PR.GetHead().GetRef()) {
+		t.Display(IssueDisplayInfo{
+			Current:     "Agent active — waiting for idle before local resolution",
+			Next:        "Waiting for agent",
+			PR:          t.PR,
+			AgentStatus: "pending",
+		})
+		return true, nil
+	}
+
 	attempts, err := t.P.gh.CountMergeConflictAttempts(ctx, t.PR.GetNumber())
 	if err != nil {
 		return false, err
@@ -101,7 +113,10 @@ func (t *PRTask) SyncBranch(ctx context.Context) (bool, error) {
 
 // ResolveConflictsLocally attempts to fix merge conflicts using an AI resolver.
 func (t *PRTask) ResolveConflictsLocally(ctx context.Context, _ int) (bool, error) {
-	failures, err := t.P.gh.CountLocalResolutionFailures(ctx, t.PR.GetNumber())
+	prNum := t.PR.GetNumber()
+	logPath := resolver.LogPath(prNum)
+
+	failures, err := t.P.gh.CountLocalResolutionFailures(ctx, prNum)
 	if err != nil {
 		return false, err
 	}
@@ -110,13 +125,24 @@ func (t *PRTask) ResolveConflictsLocally(ctx context.Context, _ int) (bool, erro
 			Current:      "Merge conflicts unresolved — needs manual fix",
 			PR:           t.PR,
 			AgentStatus:  "failed",
-			MergeLogPath: resolver.LogPath(t.PR.GetNumber()),
+			MergeLogPath: logPath,
+		})
+		return true, nil
+	}
+
+	if t.P.IsMerging(prNum) {
+		t.Display(IssueDisplayInfo{
+			Current:      "Running local AI merge resolution",
+			Next:         "Pushing resolved changes",
+			PR:           t.PR,
+			AgentStatus:  "pending",
+			MergeLogPath: logPath,
 		})
 		return true, nil
 	}
 
 	if failures > 0 {
-		lastFailure, err := t.P.gh.LastLocalResolutionFailureAt(ctx, t.PR.GetNumber())
+		lastFailure, err := t.P.gh.LastLocalResolutionFailureAt(ctx, prNum)
 		if err != nil {
 			return false, err
 		}
@@ -129,16 +155,27 @@ func (t *PRTask) ResolveConflictsLocally(ctx context.Context, _ int) (bool, erro
 				),
 				Next:         "Retrying local AI merge resolution",
 				PR:           t.PR,
-				MergeLogPath: resolver.LogPath(t.PR.GetNumber()),
+				MergeLogPath: logPath,
 			})
 			return true, nil
 		}
 	}
 
+	// Final check: don't start local resolution if the agent is still active.
+	if t.P.IsAgentActive(ctx, t.Num, t.PR.GetHead().GetRef()) {
+		t.Display(IssueDisplayInfo{
+			Current:      "Agent active — waiting for idle before resolving",
+			Next:         "Running local AI merge resolution",
+			PR:           t.PR,
+			MergeLogPath: logPath,
+		})
+		return true, nil
+	}
+
 	// Check if this specific SHA was already resolved successfully.
 	// If it was, GitHub's `mergeable_state` cache is just lagging behind.
 	successMarker := ghclient.SHAMarker("local-resolution-success", t.Sha)
-	recentlySucceeded, _, _ := t.P.gh.HasCommentContaining(ctx, t.PR.GetNumber(), successMarker)
+	recentlySucceeded, _, _ := t.P.gh.HasCommentContaining(ctx, prNum, successMarker)
 	if recentlySucceeded {
 		t.Display(IssueDisplayInfo{
 			Current:     "Merge resolved locally — waiting for PR state update",
@@ -149,12 +186,15 @@ func (t *PRTask) ResolveConflictsLocally(ctx context.Context, _ int) (bool, erro
 		return true, nil
 	}
 
+	// Start the local resolution process in the background.
+	t.P.SetMerging(prNum, true)
+	logger.Load(ctx).InfoContext(ctx, "starting background local AI merge resolution", slog.Int("pr", prNum))
 	t.Display(IssueDisplayInfo{
 		Current:      "Running local AI merge resolution",
 		Next:         "Pushing resolved changes",
 		PR:           t.PR,
 		AgentStatus:  "pending",
-		MergeLogPath: resolver.LogPath(t.PR.GetNumber()),
+		MergeLogPath: logPath,
 	})
 
 	prd := resolver.PRDetails{
@@ -163,41 +203,44 @@ func (t *PRTask) ResolveConflictsLocally(ctx context.Context, _ int) (bool, erro
 		HeadBranch: t.PR.GetHead().GetRef(),
 		BaseBranch: t.PR.GetBase().GetRef(),
 	}
-	prNum := t.PR.GetNumber()
-	newSha, err := resolver.New().RunLocalResolution(ctx, t.P.token, prd, t.P.cfg, prNum)
-	if err != nil {
-		logPath := resolver.LogPath(prNum)
-		logger.Load(ctx).ErrorContext(ctx, "local AI merge resolution failed",
-			slog.String("cmd", t.P.cfg.AIMergeResolverCmd),
-			slog.Int("pr", prNum),
-			slog.String("log", logPath),
-			slog.Any("err", err),
-		)
+
+	// Capture values for the goroutine.
+	cfg := t.P.cfg
+	token := t.P.token
+	gh := t.P.gh
+	bgCtx := context.Background()
+
+	go func() {
+		defer t.P.SetMerging(prNum, false)
+
+		newSha, err := resolver.New().RunLocalResolution(bgCtx, token, prd, cfg, prNum)
+		if err != nil {
+			logger.Load(bgCtx).ErrorContext(bgCtx, "local AI merge resolution failed",
+				slog.String("cmd", cfg.AIMergeResolverCmd),
+				slog.Int("pr", prNum),
+				slog.String("log", logPath),
+				slog.Any("err", err),
+			)
+			notice := fmt.Sprintf(
+				"copilot-autodev: local AI merge resolution via `%s` failed. Manual conflict resolution is required.\nSee `%s` for details.\n%s\n%s",
+				cfg.AIMergeResolverCmd,
+				logPath,
+				ghclient.LocalResolutionCommentMarker,
+				ghclient.LocalResolutionFailedMarker,
+			)
+			_ = gh.PostComment(bgCtx, prNum, notice)
+			return
+		}
+
 		notice := fmt.Sprintf(
-			"copilot-autodev: local AI merge resolution via `%s` failed. Manual conflict resolution is required.\nSee `%s` for details.\n%s\n%s",
-			t.P.cfg.AIMergeResolverCmd,
-			logPath,
+			"copilot-autodev: Merge conflicts were resolved locally by copilot-autodev using `%s`.\n%s\n%s",
+			cfg.AIMergeResolverCmd,
 			ghclient.LocalResolutionCommentMarker,
-			ghclient.LocalResolutionFailedMarker,
+			ghclient.SHAMarker("local-resolution-success", newSha),
 		)
-		_ = t.P.gh.PostComment(ctx, t.PR.GetNumber(), notice)
-		// Set MergeLogPath in the display immediately so the user can press
-		// 'v' on this tick without waiting for the next poll.
-		t.Display(IssueDisplayInfo{
-			Current:      "Merge conflicts unresolved — needs manual fix",
-			PR:           t.PR,
-			AgentStatus:  "failed",
-			MergeLogPath: logPath,
-		})
-		return true, nil
-	}
-	notice := fmt.Sprintf(
-		"copilot-autodev: Merge conflicts were resolved locally by copilot-autodev using `%s`.\n%s\n%s",
-		t.P.cfg.AIMergeResolverCmd,
-		ghclient.LocalResolutionCommentMarker,
-		ghclient.SHAMarker("local-resolution-success", newSha),
-	)
-	_ = t.P.gh.PostComment(ctx, t.PR.GetNumber(), notice)
+		_ = gh.PostComment(bgCtx, prNum, notice)
+	}()
+
 	return true, nil
 }
 
@@ -562,28 +605,35 @@ func (t *PRTask) FixCI(ctx context.Context) (bool, error) {
 		return false, nil
 	}
 
-	ciSHATag := ghclient.SHAMarker("ci-fix", t.Sha)
+	// Incorporate the round count into the tag so we don't get stuck on the same
+	// SHA if the agent replies without pushing.
+	ciSHATag := ghclient.SHAMarker(fmt.Sprintf("ci-fix-%d", ciFixSent+1), t.Sha)
 	alreadyPosted, postedAt, _ := t.P.gh.HasCommentContaining(ctx, t.PR.GetNumber(), ciSHATag)
 	if alreadyPosted {
-		// If the agent replied without pushing a new commit, we consider this CI-fix
-		// round complete (even if it didn't fix the issue) and proceed.
 		if hasReply, _ := t.P.agent.HasRespondedSince(ctx, t.PR.GetNumber(), postedAt); hasReply {
-			return false, nil
+			// If the agent replied, this round is done.
+			// We fall through to post the NEXT round immediately if available.
+			if ciFixSent+1 >= t.P.cfg.MaxCIFixRounds {
+				return false, nil
+			}
+			// Let the next iteration of the loop (or next poll) pick up the next round
+			// by NOT returning true here, but we need to increment ciFixSent or
+			// just let it fall through to the posting logic below which uses ciFixSent+1.
+		} else {
+			t.P.WaitForAgentCycle(
+				ctx,
+				t.PR,
+				t.Num,
+				postedAt,
+				t.P.continueTimeoutCfg(
+					"CI-fix prompt",
+					"copilot-autodev: the Copilot coding agent became unresponsive during CI fixing and %d continue attempt(s) were exhausted. The PR has been left open in review for manual inspection.",
+				),
+				fmt.Sprintf("CI-fix %d/%d — waiting for agent", ciFixSent+1, t.P.cfg.MaxCIFixRounds),
+				t.DisplayInfo,
+			)
+			return true, nil
 		}
-
-		t.P.WaitForAgentCycle(
-			ctx,
-			t.PR,
-			t.Num,
-			postedAt,
-			t.P.continueTimeoutCfg(
-				"CI-fix prompt",
-				"copilot-autodev: the Copilot coding agent became unresponsive during CI fixing and %d continue attempt(s) were exhausted. The PR has been left open in review for manual inspection.",
-			),
-			fmt.Sprintf("CI-fix %d/%d — waiting for agent", ciFixSent, t.P.cfg.MaxCIFixRounds),
-			t.DisplayInfo,
-		)
-		return true, nil
 	}
 
 	workflowName, failedJobs, err := t.P.gh.FailedRunDetails(ctx, t.Sha)
@@ -622,12 +672,23 @@ func (t *PRTask) FixCI(ctx context.Context) (bool, error) {
 
 func (t *PRTask) Merge(ctx context.Context) error {
 	if !t.AllOK {
+		ciSent, _ := t.P.gh.CountCIFixPromptsSent(ctx, t.PR.GetNumber())
+		status := fmt.Sprintf(
+			"Refinements (%d/%d) and CI-fix rounds (%d/%d) exhausted — CI still failing",
+			t.Sent,
+			t.P.cfg.MaxRefinementRounds,
+			ciSent,
+			t.P.cfg.MaxCIFixRounds,
+		)
+		if ciSent < t.P.cfg.MaxCIFixRounds && t.Sent < t.P.cfg.MaxRefinementRounds {
+			status = "CI checks are still failing — PR left in review"
+		} else if ciSent < t.P.cfg.MaxCIFixRounds {
+			status = fmt.Sprintf("CI still failing after %d/%d fix rounds — left in review",
+				ciSent, t.P.cfg.MaxCIFixRounds)
+		}
+
 		t.DisplayInfo[t.Num] = &IssueDisplayInfo{
-			Current: fmt.Sprintf(
-				"Refinements (%d/%d) and CI-fix rounds exhausted — CI still failing",
-				t.Sent,
-				t.P.cfg.MaxRefinementRounds,
-			),
+			Current:         status,
 			PR:              t.PR,
 			RefinementCount: t.Sent,
 			RefinementMax:   t.P.cfg.MaxRefinementRounds,

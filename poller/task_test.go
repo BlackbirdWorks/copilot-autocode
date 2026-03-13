@@ -731,7 +731,7 @@ func TestPRTask_FixCI(t *testing.T) {
 			wantStop: true,
 		},
 		{
-			name: "Fix handled by agent comment",
+			name: "Fix handled by agent comment but cycles remain",
 			mockHandler: func(w http.ResponseWriter, r *http.Request) {
 				path := r.URL.Path
 				switch {
@@ -763,7 +763,49 @@ func TestPRTask_FixCI(t *testing.T) {
 					_ = json.NewEncoder(w).Encode(&github.Jobs{Jobs: []*github.WorkflowJob{}})
 				}
 			},
-			wantStop: false,
+			wantStop: true, // Should stay waiting
+		},
+		{
+			name: "Fix handled by agent comment and cycles exhausted",
+			mockHandler: func(w http.ResponseWriter, r *http.Request) {
+				path := r.URL.Path
+				switch {
+				case strings.Contains(path, "/actions/runs") && r.Method == http.MethodGet:
+					_ = json.NewEncoder(w).Encode(&github.WorkflowRuns{
+						WorkflowRuns: []*github.WorkflowRun{{
+							ID:         github.Ptr(int64(101)),
+							Name:       github.Ptr("CI"),
+							Status:     github.Ptr("completed"),
+							Conclusion: github.Ptr("failure"),
+							UpdatedAt:  &github.Timestamp{Time: time.Now().Add(-1 * time.Hour)},
+						}},
+					})
+				case strings.Contains(path, "/issues/123/comments") && r.Method == http.MethodGet:
+					ciSHATag := ghclient.SHAMarker("ci-fix", "sha")
+					// Return MaxCIFixRounds failure markers
+					comments := []*github.IssueComment{
+						{
+							Body:      github.Ptr(ciSHATag),
+							CreatedAt: &github.Timestamp{Time: time.Now().Add(-2 * time.Hour)},
+							User:      &github.User{Login: github.Ptr("copilot-autodev")},
+						},
+						{
+							Body:      github.Ptr("I've fixed this CI failure."),
+							CreatedAt: &github.Timestamp{Time: time.Now().Add(-1 * time.Hour)},
+							User:      &github.User{Login: github.Ptr("copilot[bot]")},
+						},
+					}
+					for i := 0; i < 3; i++ {
+						comments = append(comments, &github.IssueComment{
+							Body: github.Ptr(ghclient.CIFixCommentMarker),
+						})
+					}
+					_ = json.NewEncoder(w).Encode(comments)
+				case strings.Contains(path, "/actions/runs/101/jobs") && r.Method == http.MethodGet:
+					_ = json.NewEncoder(w).Encode(&github.Jobs{Jobs: []*github.WorkflowJob{}})
+				}
+			},
+			wantStop: false, // Proceed to Merge
 		},
 	}
 

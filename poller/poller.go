@@ -87,8 +87,9 @@ type Poller struct {
 	Events         chan Event
 	Commands       chan Command
 	approveRetries map[int64]int
-	priorities     map[int]int // issue number → priority offset (higher = promoted first)
-	mu             sync.Mutex  // protects approveRetries and priorities across concurrent calls
+	priorities     map[int]int  // issue number → priority offset (higher = promoted first)
+	merging        map[int]bool // issue number → true if local merge resolution is in progress
+	mu             sync.Mutex   // protects approveRetries, priorities, and merging across concurrent calls
 }
 
 // New creates a Poller ready to Start.
@@ -102,6 +103,7 @@ func New(cfg *config.Config, gh *ghclient.Client, token string, ag agent.CodingA
 		Commands:       make(chan Command, 10),
 		approveRetries: make(map[int64]int),
 		priorities:     make(map[int]int),
+		merging:        make(map[int]bool),
 	}
 }
 
@@ -127,6 +129,7 @@ func (p *Poller) Start(ctx context.Context) {
 				return
 			case cmd := <-p.Commands:
 				p.HandleCommand(ctx, cmd)
+				p.Tick(ctx)
 			case <-ticker.C:
 				p.DrainCommands(ctx)
 				p.Tick(ctx)
@@ -194,13 +197,19 @@ func (p *Poller) DrainCommands(ctx context.Context) {
 	}
 }
 
-// retryMergeResolution deletes the failure marker comment from a PR so the
-// next tick will re-attempt local AI merge resolution.
+// retryMergeResolution deletes the failure and success marker comments from a
+// PR so the next tick will re-attempt local AI merge resolution.
 func (p *Poller) retryMergeResolution(ctx context.Context, prNum int) {
 	logger.Load(ctx).InfoContext(ctx, "retrying local merge resolution", slog.Int("pr", prNum))
+	// Clear failure markers.
 	if err := p.gh.DeleteCommentContaining(ctx, prNum, ghclient.LocalResolutionFailedMarker); err != nil {
 		logger.Load(ctx).
 			WarnContext(ctx, "failed to delete merge resolution failure marker", slog.Int("pr", prNum), slog.Any("err", err))
+	}
+	// Clear success markers (e.g. if GitHub is stuck lagging behind).
+	if err := p.gh.DeleteCommentContaining(ctx, prNum, "copilot-autodev:local-resolution-success"); err != nil {
+		logger.Load(ctx).
+			WarnContext(ctx, "failed to delete merge resolution success marker", slog.Int("pr", prNum), slog.Any("err", err))
 	}
 }
 
@@ -255,6 +264,24 @@ func (p *Poller) adjustPriority(ctx context.Context, issueNum, delta int) {
 	p.mu.Unlock()
 	logger.Load(ctx).
 		InfoContext(ctx, "priority adjusted", slog.Int("issue", issueNum), slog.Int("priority", newPri))
+}
+
+// IsMerging returns true if the issue is currently undergoing local merge resolution.
+func (p *Poller) IsMerging(issueNum int) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.merging[issueNum]
+}
+
+// SetMerging updates the local merge resolution status for an issue.
+func (p *Poller) SetMerging(issueNum int, merging bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if merging {
+		p.merging[issueNum] = true
+	} else {
+		delete(p.merging, issueNum)
+	}
 }
 
 // FetchAllIssues returns the queue, coding, and reviewing issue lists fetched
@@ -406,13 +433,16 @@ func (p *Poller) PromoteFromQueue(ctx context.Context, queue []*github.Issue) er
 			logger.Load(ctx).InfoContext(ctx, "found existing PR; skipping invoke",
 				slog.Int("issue", num), slog.Int("pr", existingPR.GetNumber()))
 			if err := p.gh.SwapLabel(ctx, num, p.cfg.LabelQueue, p.cfg.LabelCoding); err != nil {
-				return err
+				logger.Load(ctx).ErrorContext(ctx, "failed to swap label during promotion",
+					slog.Int("issue", num), slog.Any("err", err))
 			}
 			continue
 		}
 
 		if err := p.gh.SwapLabel(ctx, num, p.cfg.LabelQueue, p.cfg.LabelCoding); err != nil {
-			return err
+			logger.Load(ctx).ErrorContext(ctx, "failed to swap label during promotion",
+				slog.Int("issue", num), slog.Any("err", err))
+			continue
 		}
 		prompt := FormatFallbackPrompt(p.cfg.FallbackIssueInvokePrompt, issue)
 		jobID, capiErr := p.agent.InvokeTask(ctx, prompt, issue.GetTitle(), num, issue.GetHTMLURL())
@@ -486,7 +516,7 @@ func (p *Poller) ProcessCodingPR(
 ) error {
 	sha := pr.GetHead().GetSHA()
 	running, err := p.gh.AnyWorkflowRunActive(ctx, sha)
-	if (err == nil && running) || p.IsAgentActive(ctx, num) {
+	if (err == nil && running) || p.IsAgentActive(ctx, num, pr.GetHead().GetRef()) {
 		label := "Agent finalizing code"
 		if p.gh.IsPRDraft(pr) {
 			label = "Copilot is writing code"
@@ -611,7 +641,7 @@ func (p *Poller) NudgeSingleCodingIssue(
 		return nil
 	}
 
-	if p.IsAgentActive(ctx, num) {
+	if p.IsAgentActive(ctx, num, fmt.Sprintf("copilot-autodev/issue-%d", num)) {
 		displayInfo[num] = &IssueDisplayInfo{
 			Current:     "Agent actively running — waiting",
 			Next:        "Re-check next poll",
@@ -624,8 +654,8 @@ func (p *Poller) NudgeSingleCodingIssue(
 }
 
 // IsAgentActive checks if the coding agent has any work in progress.
-func (p *Poller) IsAgentActive(ctx context.Context, num int) bool {
-	return p.agent.IsActive(ctx, num)
+func (p *Poller) IsAgentActive(ctx context.Context, num int, branch string) bool {
+	return p.agent.IsActive(ctx, num, branch)
 }
 
 // RequestNudge re-invokes the agent via CAPI.

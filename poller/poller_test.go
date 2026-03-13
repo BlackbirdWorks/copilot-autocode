@@ -107,7 +107,7 @@ func TestPoller_IsAgentActive(t *testing.T) {
 					w.WriteHeader(http.StatusNotFound)
 				}
 			})
-			active := p.IsAgentActive(ctx, tt.args.num)
+			active := p.IsAgentActive(ctx, tt.args.num, "copilot-autodev/issue-123")
 			assert.Equal(t, tt.wants.active, active)
 		})
 	}
@@ -895,6 +895,28 @@ func TestPoller_HandleCommand(t *testing.T) {
 						})
 					}
 					if strings.Contains(r.URL.Path, "/issues/comments/456") &&
+						r.Method == http.MethodDelete {
+						w.WriteHeader(http.StatusNoContent)
+					}
+				},
+			},
+			wants: wants{},
+		},
+		{
+			name: "retry-merge with success marker",
+			args: args{
+				cmd: poller.Command{Action: "retry-merge", PRNum: 123},
+				mockHandler: func(w http.ResponseWriter, r *http.Request) {
+					if strings.Contains(r.URL.Path, "/issues/123/comments") &&
+						r.Method == http.MethodGet {
+						_ = json.NewEncoder(w).Encode([]*github.IssueComment{
+							{
+								ID:   github.Ptr(int64(789)),
+								Body: github.Ptr("copilot-autodev:local-resolution-success:sha123"),
+							},
+						})
+					}
+					if strings.Contains(r.URL.Path, "/issues/comments/789") &&
 						r.Method == http.MethodDelete {
 						w.WriteHeader(http.StatusNoContent)
 					}

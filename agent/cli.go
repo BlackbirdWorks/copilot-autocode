@@ -291,7 +291,7 @@ func (a *CLIAgent) GetTaskStatus(ctx context.Context, jobID string) (*TaskStatus
 	return &TaskStatus{JobID: jobID, Status: "completed"}, nil
 }
 
-func (a *CLIAgent) IsActive(_ context.Context, issueNum int) bool {
+func (a *CLIAgent) IsActive(_ context.Context, issueNum int, _ string) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	handle, ok := a.active[issueNum]

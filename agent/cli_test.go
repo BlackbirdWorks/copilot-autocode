@@ -44,7 +44,7 @@ func (m *mockRunner) Output(ctx context.Context, dir, name string, args ...strin
 func TestCLIAgent_IsActive(t *testing.T) {
 	t.Parallel()
 	ag := agent.NewCLIAgent(nil, nil, "token")
-	assert.False(t, ag.IsActive(context.Background(), 123))
+	assert.False(t, ag.IsActive(context.Background(), 123, "branch"))
 }
 
 func TestCLIAgent_InvokeTask_Simple(t *testing.T) {
@@ -113,7 +113,7 @@ func TestCLIAgent_InvokeTask_Async(t *testing.T) {
 
 	// Poll IsActive until it's false (goroutine finished)
 	assert.Eventually(t, func() bool {
-		return !ag.IsActive(ctx, 123)
+		return !ag.IsActive(ctx, 123, "branch")
 	}, 2*time.Second, 10*time.Millisecond)
 
 	// Check status
@@ -223,7 +223,7 @@ func TestCLIAgent_InvokeTask_Failures(t *testing.T) {
 			require.NoError(t, err)
 
 			assert.Eventually(t, func() bool {
-				return !ag.IsActive(ctx, 123)
+				return !ag.IsActive(ctx, 123, "branch")
 			}, 1*time.Second, 10*time.Millisecond)
 		})
 	}

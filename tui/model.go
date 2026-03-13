@@ -641,8 +641,13 @@ func (m Model) handleRetry() (Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// Retry merge resolution (existing behavior).
-	if s.CurrentStatus == mergeFixStatus && s.PR != nil {
+	// Retry merge resolution.
+	// We allow retry if the status exactly matches mergeFixStatus,
+	// OR if it's a failed/waiting merge (has log path and is not success/pending),
+	// OR if it's stuck in "Merge resolved locally".
+	isMergeFailure := s.MergeLogPath != "" && s.AgentStatus != "success" && s.AgentStatus != "pending"
+	isStuckSuccess := strings.Contains(s.CurrentStatus, "Merge resolved locally")
+	if (s.CurrentStatus == mergeFixStatus || isMergeFailure || isStuckSuccess) && s.PR != nil {
 		m.commandCh <- poller.Command{
 			Action: "retry-merge",
 			PRNum:  s.PR.GetNumber(),
@@ -667,7 +672,11 @@ func (m Model) handleRetry() (Model, tea.Cmd) {
 		)
 	}
 
-	return m, nil
+	m.actionFeedback = "Nothing to retry for selected item"
+	return m, tea.Tick(
+		tuiCopyFeedbackDuration,
+		func(_ time.Time) tea.Msg { return clearActionMsg{} },
+	)
 }
 
 // handleCleanWorkdir removes the working directory for the selected item's issue.

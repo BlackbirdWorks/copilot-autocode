@@ -42,7 +42,7 @@ func (a *CloudAgent) GetTaskStatus(ctx context.Context, jobID string) (*TaskStat
 	return ts, nil
 }
 
-func (a *CloudAgent) IsActive(ctx context.Context, issueNum int) bool {
+func (a *CloudAgent) IsActive(ctx context.Context, issueNum int, branch string) bool {
 	jobID, _ := a.gh.LatestCopilotJobID(ctx, issueNum)
 	if jobID != "" {
 		status, err := a.gh.GetCopilotJobStatus(ctx, jobID)
@@ -54,7 +54,7 @@ func (a *CloudAgent) IsActive(ctx context.Context, issueNum int) bool {
 			}
 		}
 	}
-	if active, err := a.gh.HasActiveCopilotRun(ctx); err == nil && active {
+	if active, err := a.gh.HasActiveCopilotRunForBranch(ctx, branch); err == nil && active {
 		return true
 	}
 	return false

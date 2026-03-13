@@ -40,7 +40,7 @@ func TestPRTask_ResolveConflictsLocally(t *testing.T) {
 					json.NewEncoder(w).Encode([]*github.IssueComment{})
 				}
 			},
-			expectStatus: "Merge conflicts unresolved — needs manual fix",
+			expectStatus: "Running local AI merge resolution",
 		},
 		{
 			name:     "exhausted retries",
@@ -89,7 +89,7 @@ func TestPRTask_ResolveConflictsLocally(t *testing.T) {
 					json.NewEncoder(w).Encode(comments)
 				}
 			},
-			expectStatus: "Merge conflicts unresolved — needs manual fix", // Will attempt and fail
+			expectStatus: "Running local AI merge resolution",
 		},
 		{
 			name:     "already resolved successfully",
@@ -105,6 +105,28 @@ func TestPRTask_ResolveConflictsLocally(t *testing.T) {
 			},
 			expectStatus: "Merge resolved locally",
 		},
+		{
+			name:     "agent active on CAPI",
+			attempts: 2,
+			setupMock: func(w http.ResponseWriter, r *http.Request) {
+				if strings.Contains(r.URL.Path, "/repos/test-owner/test-repo/issues/123/comments") {
+					comments := []*github.IssueComment{
+						{
+							Body:      github.Ptr("<!-- copilot-autodev:job-id:job-1 -->"),
+							CreatedAt: &github.Timestamp{Time: time.Now()},
+						},
+					}
+					json.NewEncoder(w).Encode(comments)
+				}
+				if strings.Contains(r.URL.Path, "/agents/swe/v1/jobs") {
+					json.NewEncoder(w).Encode(map[string]any{
+						"job_id": "job-1",
+						"status": "in_progress",
+					})
+				}
+			},
+			expectStatus: "Agent active — waiting for idle before resolving",
+		},
 	}
 
 	for _, tt := range tests {
@@ -113,20 +135,18 @@ func TestPRTask_ResolveConflictsLocally(t *testing.T) {
 
 			rt := &fakeRoundTripper{
 				handler: func(r *http.Request) (*http.Response, error) {
-					// GitHub API requests usually have query params, so we check for prefix.
-					if strings.Contains(
-						r.URL.Path,
-						"/repos/test-owner/test-repo/issues/123/comments",
-					) {
-						rec := httptest.NewRecorder()
+					rec := httptest.NewRecorder()
+					if tt.setupMock != nil {
 						tt.setupMock(rec, r)
-						return rec.Result(), nil
 					}
-					// Return empty JSON for everything else to avoid 404/decode errors
-					return &http.Response{
-						StatusCode: http.StatusOK,
-						Body:       http.NoBody,
-					}, nil
+					res := rec.Result()
+					if res.StatusCode == 0 {
+						res.StatusCode = http.StatusOK
+					}
+					if res.Body == nil || res.ContentLength == 0 {
+						res.Body = http.NoBody
+					}
+					return res, nil
 				},
 			}
 			cfg := config.DefaultConfig()

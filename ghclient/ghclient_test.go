@@ -592,9 +592,10 @@ func TestApprovePendingDeployments(t *testing.T) {
 	}
 }
 
-// TestHasActiveCopilotRun verifies that the Copilot-run guard correctly
+// TestHasActiveCopilotRunForBranch verifies that the Copilot-run guard correctly
 // identifies active runs from Copilot actors and ignores non-Copilot runs.
-func TestHasActiveCopilotRun(t *testing.T) {
+// It also verifies that the check is scoped to the specific branch.
+func TestHasActiveCopilotRunForBranch(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
 		name       string
@@ -670,7 +671,7 @@ func TestHasActiveCopilotRun(t *testing.T) {
 				_ = json.NewEncoder(w).Encode(resp)
 			})
 
-			active, err := c.HasActiveCopilotRun(t.Context())
+			active, err := c.HasActiveCopilotRunForBranch(t.Context(), "feat/branch")
 			require.NoError(t, err)
 			assert.Equal(t, tc.wantActive, active)
 		})
@@ -1412,22 +1413,32 @@ func TestDeleteCommentContaining(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
 		name    string
-		body    string
+		bodies  []string
 		needle  string
+		wantDel int
 		wantErr bool
 	}{
-		{"found and deleted", "target marker", "target", false},
-		{"not found", "other comment", "target", false},
+		{"found and deleted", []string{"target marker"}, "target", 1, false},
+		{"not found", []string{"other comment"}, "target", 0, false},
+		{"multiple matches", []string{"target 1", "other", "target 2"}, "target", 2, false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
+			var delCount int
 			c := setupMockGitHubAPI(t, func(w http.ResponseWriter, r *http.Request) {
 				switch r.Method {
 				case http.MethodGet:
-					_ = json.NewEncoder(w).
-						Encode([]*github.IssueComment{{ID: github.Ptr(int64(10)), Body: github.Ptr(tc.body)}})
+					var comments []*github.IssueComment
+					for i, body := range tc.bodies {
+						comments = append(comments, &github.IssueComment{
+							ID:   github.Ptr(int64(10 + i)),
+							Body: github.Ptr(body),
+						})
+					}
+					_ = json.NewEncoder(w).Encode(comments)
 				case http.MethodDelete:
+					delCount++
 					w.WriteHeader(http.StatusNoContent)
 				}
 			})
@@ -1437,6 +1448,7 @@ func TestDeleteCommentContaining(t *testing.T) {
 				return
 			}
 			require.NoError(t, err)
+			assert.Equal(t, tc.wantDel, delCount)
 		})
 	}
 }

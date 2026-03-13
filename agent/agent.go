@@ -25,8 +25,9 @@ type CodingAgent interface {
 	// GetTaskStatus returns the status of a previously created task.
 	GetTaskStatus(ctx context.Context, jobID string) (*TaskStatus, error)
 
-	// IsActive checks if the agent has any work in progress for the given issue.
-	IsActive(ctx context.Context, issueNum int) bool
+	// IsActive checks if the agent has any work in progress for the given issue
+	// on the specified branch.
+	IsActive(ctx context.Context, issueNum int, branch string) bool
 
 	// SendPrompt sends a follow-up prompt to the agent (refinement, CI fix,
 	// merge conflict resolution, or continue).  For cloud agents this posts a
