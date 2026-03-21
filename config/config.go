@@ -170,6 +170,15 @@ type Config struct {
 	// Default: 60 (1 hour).
 	MergeLogRetentionMinutes int `yaml:"merge_log_retention_minutes"`
 
+	// CIMaxRetries is the number of times @copilot is asked to fix CI failures
+	// before the orchestrator stops. Default: 6.
+	CIMaxRetries int `yaml:"ci_max_retries"`
+
+	// AssignInsteadOfInvoke, if true, will assign the issue to copilot[bot]
+	// instead of calling the Copilot Jobs API. This is useful as a workaround
+	// for 400 Bad Request errors. Default: false.
+	AssignInsteadOfInvoke bool `yaml:"assign_instead_of_invoke"`
+
 	// AgentType selects the coding agent backend.
 	// "cloud" (default) uses the GitHub Copilot cloud API.
 	// "cli" uses a local CLI agent (e.g. copilot, claude, aider).
@@ -232,7 +241,7 @@ func DefaultConfig() *Config {
 		AIMergeResolverPrompt:         "Please resolve all git merge conflicts in this repository. Make minimal changes to resolve the conflicts while preserving the intent of both sides.",
 		CopilotInvokeTimeoutSeconds:   defaultCopilotInvokeTimeoutSecs,
 		CopilotInvokeMaxRetries:       defaultCopilotInvokeMaxRetries,
-		FallbackIssueInvokePrompt:     "Please start working on issue #{issue_number}: {issue_title}.\n{issue_url}\n\nPlease commit and push often so you don't lose work.",
+		FallbackIssueInvokePrompt:     "Please start working on issue #{issue_number}: {issue_title}.\n{issue_url}\n\nPlease make a pull request with your changes. Please commit and push often so you don't lose work.",
 		AgentTimeoutRetryDelaySeconds: defaultAgentTimeoutRetryDelaySecs,
 		AgentContinuePrompt:           "@copilot continue. Please commit and push often so you don't lose work.",
 		MaxAgentContinueRetries:       defaultMaxAgentContinueRetries,

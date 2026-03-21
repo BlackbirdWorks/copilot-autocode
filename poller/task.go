@@ -24,6 +24,7 @@ type PRTask struct {
 	Sha string
 
 	DisplayInfo map[int]*IssueDisplayInfo
+	Manager     *AISessionManager
 
 	Sent    int
 	AllOK   bool
@@ -175,20 +176,38 @@ func (t *PRTask) ResolveConflictsLocally(ctx context.Context, _ int) (bool, erro
 	// Check if this specific SHA was already resolved successfully.
 	// If it was, GitHub's `mergeable_state` cache is just lagging behind.
 	successMarker := ghclient.SHAMarker("local-resolution-success", t.Sha)
-	recentlySucceeded, _, _ := t.P.gh.HasCommentContaining(ctx, prNum, successMarker)
+	recentlySucceeded, postedAt, _ := t.P.gh.HasCommentContaining(ctx, prNum, successMarker)
 	if recentlySucceeded {
+		// If the success marker is very fresh, we wait for GitHub's cache to update.
+		// However, if it's been more than 2 minutes and the PR is still "dirty",
+		// then something went wrong (e.g. resolution push failed silently or
+		// GitHub's state is permanently stuck) and we should retry.
+		if time.Since(postedAt) < 2*time.Minute {
+			t.Display(IssueDisplayInfo{
+				Current:      "Merge resolved locally — waiting for PR state update",
+				Next:         "Checking next poll",
+				PR:           t.PR,
+				AgentStatus:  "success",
+				MergeLogPath: logPath,
+			})
+			return true, nil
+		}
+		logger.Load(ctx).InfoContext(ctx, "local resolution success marker timed out; retrying",
+			slog.Int("pr", prNum), slog.Duration("age", time.Since(postedAt)))
+	}
+
+	// Start the local resolution process
+	if !t.Manager.TryAcquire(t.Num) {
 		t.Display(IssueDisplayInfo{
-			Current:     "Merge resolved locally — waiting for PR state update",
-			Next:        "Checking next poll",
+			Current:     "At AI session limit — waiting for local resolution slot",
+			Next:        "Waiting for AI capacity",
 			PR:          t.PR,
-			AgentStatus: "success",
+			AgentStatus: "pending",
 		})
 		return true, nil
 	}
 
-	// Start the local resolution process in the background.
-	t.P.SetMerging(prNum, true)
-	logger.Load(ctx).InfoContext(ctx, "starting background local AI merge resolution", slog.Int("pr", prNum))
+	logger.Load(ctx).InfoContext(ctx, "starting local merge resolution", slog.Int("pr", t.Num))
 	t.Display(IssueDisplayInfo{
 		Current:      "Running local AI merge resolution",
 		Next:         "Pushing resolved changes",
@@ -196,6 +215,9 @@ func (t *PRTask) ResolveConflictsLocally(ctx context.Context, _ int) (bool, erro
 		AgentStatus:  "pending",
 		MergeLogPath: logPath,
 	})
+
+	t.P.SetMerging(prNum, true)
+	logger.Load(ctx).InfoContext(ctx, "starting background local AI merge resolution", slog.Int("pr", prNum))
 
 	prd := resolver.PRDetails{
 		Owner:      t.P.cfg.GitHubOwner,
@@ -212,6 +234,7 @@ func (t *PRTask) ResolveConflictsLocally(ctx context.Context, _ int) (bool, erro
 
 	go func() {
 		defer t.P.SetMerging(prNum, false)
+		defer t.Manager.Release(t.Num)
 
 		newSha, err := resolver.New().RunLocalResolution(bgCtx, token, prd, cfg, prNum)
 		if err != nil {
@@ -372,7 +395,14 @@ func (t *PRTask) WaitForCI(ctx context.Context) (bool, error) {
 
 	anyActive := false
 	ciCompleted, ciTotal, ciPassed, ciFailed := 0, 0, 0, 0
+	seen := make(map[string]bool)
 	for _, r := range runs {
+		name := r.GetName()
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+
 		ciTotal++
 		status := r.GetStatus()
 		if status == "in_progress" || status == "queued" || status == "requested" {
@@ -482,6 +512,21 @@ func (t *PRTask) HandleTimeout(ctx context.Context) (bool, error) {
 		return true, nil
 	}
 
+	if t.P.IsAgentActive(ctx, t.Num, t.PR.GetHead().GetRef()) {
+		return false, nil
+	}
+
+	if !t.Manager.TryAcquire(t.Num) {
+		t.Display(IssueDisplayInfo{
+			Current:     "At AI session limit — waiting to continue",
+			Next:        "Waiting for AI capacity",
+			PR:          t.PR,
+			AgentStatus: "pending",
+		})
+		return true, nil
+	}
+
+	// Trigger AI continue.
 	_ = t.P.agent.SendPrompt(ctx, agent.PromptRequest{
 		PRNum:      t.PR.GetNumber(),
 		IssueNum:   t.Num,

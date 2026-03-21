@@ -94,7 +94,7 @@ func main() {
 		ag = agent.NewCLIAgent(gh, cfg, token)
 		bootstrapLogger.Info("using CLI agent backend", slog.String("cmd", cfg.CLIAgentCmd))
 	default:
-		ag = agent.NewCloudAgent(gh)
+		ag = agent.NewCloudAgent(gh, cfg)
 	}
 
 	// Create and start the background poller.

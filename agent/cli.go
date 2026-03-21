@@ -56,10 +56,11 @@ type CLIAgent struct {
 }
 
 type taskHandle struct {
-	cancel context.CancelFunc
-	done   chan struct{}
-	err    error
-	dir    string // persistent working directory
+	cancel    context.CancelFunc
+	done      chan struct{}
+	err       error
+	dir       string    // persistent working directory
+	StartTime time.Time // when the task was started
 }
 
 // NewCLIAgent creates a CLIAgent backed by the given GitHub client, config, and token.
@@ -125,7 +126,12 @@ func (a *CLIAgent) InvokeTask(
 
 	dir := a.workDir(issueNum)
 	taskCtx, cancel := context.WithCancel(ctx)
-	handle := &taskHandle{cancel: cancel, done: make(chan struct{}), dir: dir}
+	h := &taskHandle{
+		cancel:    cancel,
+		done:      make(chan struct{}),
+		dir:       dir,
+		StartTime: time.Now(),
+	}
 
 	a.mu.Lock()
 	// Cancel any existing task for this issue.
@@ -133,26 +139,26 @@ func (a *CLIAgent) InvokeTask(
 		prev.cancel()
 	}
 	delete(a.failed, issueNum)
-	a.active[issueNum] = handle
+	a.active[issueNum] = h
 	a.mu.Unlock()
 
 	go func() {
-		defer close(handle.done)
+		defer close(h.done)
 		defer cancel()
-		handle.err = a.runCLITask(taskCtx, fullPrompt, issueTitle, issueNum, branch, dir)
+		h.err = a.runCLITask(taskCtx, fullPrompt, issueTitle, issueNum, branch, dir)
 
 		a.mu.Lock()
-		if a.active[issueNum] == handle {
+		if a.active[issueNum] == h {
 			delete(a.active, issueNum)
-			if handle.err != nil {
-				a.failed[issueNum] = handle
+			if h.err != nil {
+				a.failed[issueNum] = h
 			}
 		}
 		a.mu.Unlock()
 
-		if handle.err != nil {
+		if h.err != nil {
 			logger.Load(ctx).ErrorContext(ctx, "CLI agent task failed",
-				slog.Int("issue", issueNum), slog.Any("err", handle.err))
+				slog.Int("issue", issueNum), slog.Any("err", h.err))
 		}
 	}()
 
@@ -291,19 +297,24 @@ func (a *CLIAgent) GetTaskStatus(ctx context.Context, jobID string) (*TaskStatus
 	return &TaskStatus{JobID: jobID, Status: "completed"}, nil
 }
 
-func (a *CLIAgent) IsActive(_ context.Context, issueNum int, _ string) bool {
+func (a *CLIAgent) IsActive(ctx context.Context, issueNum int, _ string) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	handle, ok := a.active[issueNum]
-	if !ok {
-		return false
+	if h, ok := a.active[issueNum]; ok {
+		// Check for 1-hour timeout
+		if !h.StartTime.IsZero() && time.Since(h.StartTime) > time.Hour {
+			logger.Load(ctx).WarnContext(ctx, "CLI agent task hard timeout (> 1h); cancelling", slog.Int("issue", issueNum))
+			h.cancel()
+			return false
+		}
+		select {
+		case <-h.done:
+			return false
+		default:
+			return true
+		}
 	}
-	select {
-	case <-handle.done:
-		return false
-	default:
-		return true
-	}
+	return false
 }
 
 func (a *CLIAgent) SendPrompt(ctx context.Context, req PromptRequest) error {

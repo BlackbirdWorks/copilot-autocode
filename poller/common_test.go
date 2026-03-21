@@ -30,7 +30,7 @@ func setupMockPoller(t *testing.T, handler http.HandlerFunc) *poller.Poller {
 	cfg.CopilotInvokeTimeoutSeconds = 60 // faster for tests
 
 	client := ghclient.NewWithTransport("test-token", cfg, rt)
-	ag := agent.NewCloudAgent(client)
+	ag := agent.NewCloudAgent(client, cfg)
 	return poller.New(cfg, client, "test-token", ag)
 }
 

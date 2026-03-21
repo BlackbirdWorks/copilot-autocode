@@ -46,7 +46,7 @@ func setupInternalPoller(t *testing.T, handler http.HandlerFunc) *Poller {
 	cfg.PollIntervalSeconds = 1
 
 	client := ghclient.NewWithTransport("test-token", cfg, rt)
-	ag := agent.NewCloudAgent(client)
+	ag := agent.NewCloudAgent(client, cfg)
 	return New(cfg, client, "test-token", ag)
 }
 
@@ -302,11 +302,13 @@ func TestNudgeSingleCodingIssue_WithinTimeoutAndExhausted(t *testing.T) {
 	})
 
 	displayInfo := map[int]*IssueDisplayInfo{}
+	manager := &AISessionManager{Slots: 1, Active: make(map[int]bool)}
 	err := p.NudgeSingleCodingIssue(
 		context.Background(),
 		&github.Issue{Number: github.Ptr(123)},
 		displayInfo,
 		10*time.Minute,
+		manager,
 	)
 	require.NoError(t, err)
 	require.Contains(t, displayInfo, 123)
@@ -341,11 +343,13 @@ func TestNudgeSingleCodingIssue_WithinTimeoutAndExhausted(t *testing.T) {
 	p2.cfg.CopilotInvokeMaxRetries = 1
 
 	displayInfo = map[int]*IssueDisplayInfo{}
+	manager2 := &AISessionManager{Slots: 1, Active: make(map[int]bool)}
 	err = p2.NudgeSingleCodingIssue(
 		context.Background(),
 		&github.Issue{Number: github.Ptr(123)},
 		displayInfo,
 		10*time.Minute,
+		manager2,
 	)
 	require.NoError(t, err)
 	assert.Contains(t, displayInfo[123].Current, "No response after")
