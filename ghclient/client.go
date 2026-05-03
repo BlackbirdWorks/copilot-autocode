@@ -204,6 +204,13 @@ func (c *Client) httpClient() *http.Client {
 	return http.DefaultClient
 }
 
+func (c *Client) Owner() string         { return c.owner }
+func (c *Client) Repo() string          { return c.repo }
+func (c *Client) LabelQueue() string    { return c.labelQueue }
+func (c *Client) LabelCoding() string   { return c.labelCoding }
+func (c *Client) LabelReview() string   { return c.labelReview }
+func (c *Client) LabelTakeover() string { return c.labelTakeover }
+
 // IssuesByLabel returns all open issues carrying the given label.
 func (c *Client) IssuesByLabel(ctx context.Context, label string) ([]*github.Issue, error) {
 	var all []*github.Issue
@@ -247,6 +254,26 @@ func (c *Client) IssuesByLabel(ctx context.Context, label string) ([]*github.Iss
 func (c *Client) AddLabel(ctx context.Context, issueNum int, label string) error {
 	_, _, err := c.gh.Issues.AddLabelsToIssue(ctx, c.owner, c.repo, issueNum, []string{label})
 	return err
+}
+
+// AssignIssue adds an assignee to the given issue/PR.
+func (c *Client) AssignIssue(ctx context.Context, num int, login string) error {
+	_, _, err := c.gh.Issues.AddAssignees(ctx, c.owner, c.repo, num, []string{login})
+	return err
+}
+
+// IsIssueAssignedTo checks if the given issue/PR is assigned to the specified login.
+func (c *Client) IsIssueAssignedTo(ctx context.Context, num int, login string) (bool, error) {
+	issue, _, err := c.gh.Issues.Get(ctx, c.owner, c.repo, num)
+	if err != nil {
+		return false, fmt.Errorf("get issue: %w", err)
+	}
+	for _, a := range issue.Assignees {
+		if strings.EqualFold(a.GetLogin(), login) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // RemoveLabel removes a label from the given issue number (ignores 404).
@@ -474,8 +501,8 @@ func (c *Client) FindPRByListing(ctx context.Context, issueNum int) *github.Pull
 }
 
 func (c *Client) DiscoverPRViaJobID(ctx context.Context, issueNum int) *github.PullRequest {
-	jobID, _ := c.LatestCopilotJobID(ctx, issueNum)
-	if jobID == "" {
+	jobID, _, err := c.LatestCopilotJobID(ctx, issueNum)
+	if err != nil || jobID == "" {
 		return nil
 	}
 	status, err := c.GetCopilotJobStatus(ctx, jobID)
@@ -797,9 +824,16 @@ func (c *Client) FailedRunDetails(
 
 	var workflowName string
 	var runID int64
+	seen := make(map[string]bool)
 	for _, r := range runs {
+		name := r.GetName()
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+
 		if r.GetConclusion() == "failure" {
-			workflowName = r.GetName()
+			workflowName = name
 			runID = r.GetID()
 			break
 		}
@@ -943,7 +977,14 @@ func (c *Client) LatestFailedRunConclusion(
 	if err != nil {
 		return "", time.Time{}, err
 	}
+	seen := make(map[string]bool)
 	for _, r := range runs {
+		name := r.GetName()
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+
 		if r.GetStatus() != runStatusCompleted {
 			continue
 		}
@@ -981,7 +1022,14 @@ func (c *Client) ListActionRequiredRuns(
 		return nil, err
 	}
 	var required []*github.WorkflowRun
+	seen := make(map[string]bool)
 	for _, r := range runs {
+		name := r.GetName()
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+
 		status := r.GetStatus()
 		if status == "action_required" || status == "waiting" {
 			required = append(required, r)
@@ -1003,7 +1051,14 @@ func (c *Client) ListPendingDeploymentRuns(
 		return nil, err
 	}
 	var required []*github.WorkflowRun
+	seen := make(map[string]bool)
 	for _, r := range runs {
+		name := r.GetName()
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+
 		if r.GetStatus() == runStatusCompleted && r.GetConclusion() == "action_required" {
 			required = append(required, r)
 		}
@@ -1252,6 +1307,52 @@ func (c *Client) HasAgentCommentSince(ctx context.Context, num int, since time.T
 		opts.Page = resp.NextPage
 	}
 	return false, nil
+}
+
+// CopilotEngagementStatus checks if the Copilot agent has acknowledged the most
+// recent prompt with a reaction, but hasn't yet responded with a comment.
+// Returns true and the reaction timestamp if the agent is engaged.
+func (c *Client) CopilotEngagementStatus(ctx context.Context, num int) (bool, time.Time, error) {
+	opts := &github.IssueListCommentsOptions{
+		ListOptions: github.ListOptions{PerPage: 100},
+	}
+	var allComments []*github.IssueComment
+	for {
+		comments, resp, err := c.gh.Issues.ListComments(ctx, c.owner, c.repo, num, opts)
+		if err != nil {
+			return false, time.Time{}, err
+		}
+		allComments = append(allComments, comments...)
+		if resp.NextPage == 0 {
+			break
+		}
+		opts.Page = resp.NextPage
+	}
+
+	for i := len(allComments) - 1; i >= 0; i-- {
+		cm := allComments[i]
+		login := strings.ToLower(cm.GetUser().GetLogin())
+		
+		if strings.Contains(login, "copilot") && login != "copilot-autodev" {
+			return false, time.Time{}, nil
+		}
+
+		if strings.Contains(strings.ToLower(cm.GetBody()), "@copilot") {
+			if cm.GetReactions().GetTotalCount() > 0 {
+				reactions, _, err := c.gh.Reactions.ListIssueCommentReactions(ctx, c.owner, c.repo, cm.GetID(), nil)
+				if err == nil {
+					for _, react := range reactions {
+						rLogin := strings.ToLower(react.GetUser().GetLogin())
+						if strings.Contains(rLogin, "copilot") && rLogin != "copilot-autodev" {
+							return true, cm.GetCreatedAt().Time, nil
+						}
+					}
+				}
+			}
+			return false, time.Time{}, nil
+		}
+	}
+	return false, time.Time{}, nil
 }
 
 // lastCommentWithMarker returns the timestamp of the most recent issue/PR
@@ -1551,8 +1652,8 @@ func (c *Client) GetJobStatusAt(
 }
 
 // LatestCopilotJobID returns the most recent Copilot task job ID recorded on the
-// issue, or an empty string if none exist.
-func (c *Client) LatestCopilotJobID(ctx context.Context, issueNum int) (string, error) {
+// issue and its creation time, or an empty string and zero time if none exist.
+func (c *Client) LatestCopilotJobID(ctx context.Context, issueNum int) (string, time.Time, error) {
 	var latestJobID string
 	var latest time.Time
 
@@ -1562,7 +1663,7 @@ func (c *Client) LatestCopilotJobID(ctx context.Context, issueNum int) (string, 
 	for {
 		comments, resp, err := c.gh.Issues.ListComments(ctx, c.owner, c.repo, issueNum, opts)
 		if err != nil {
-			return "", fmt.Errorf("list comments (#%d): %w", issueNum, err)
+			return "", time.Time{}, fmt.Errorf("list comments (#%d): %w", issueNum, err)
 		}
 		for _, cm := range comments {
 			body := cm.GetBody()
@@ -1583,7 +1684,7 @@ func (c *Client) LatestCopilotJobID(ctx context.Context, issueNum int) (string, 
 		}
 		opts.Page = resp.NextPage
 	}
-	return latestJobID, nil
+	return latestJobID, latest, nil
 }
 
 // ReadAgentType returns the agent type ("cloud" or "cli") recorded on the
@@ -1638,7 +1739,7 @@ func (c *Client) ReadAgentType(ctx context.Context, issueNum int) string {
 func (c *Client) InvokeCopilotAgent(
 	ctx context.Context, prompt, issueTitle string, issueNum int, issueURL string,
 ) (string, error) {
-	prompt = fmt.Sprintf("%s\n\nFixes #%d", prompt, issueNum)
+	prompt = fmt.Sprintf("%s\n\nFixes #%d. Please make a pull request with your changes.", prompt, issueNum)
 	endpoint := fmt.Sprintf(
 		"%s/agents/swe/v1/jobs/%s/%s",
 		copilotAPIBase,
@@ -1822,6 +1923,37 @@ func (c *Client) DeleteCommentContaining(ctx context.Context, num int, needle st
 		}
 		for _, cm := range comments {
 			if strings.Contains(cm.GetBody(), needle) {
+				if _, err := c.gh.Issues.DeleteComment(ctx, c.owner, c.repo, cm.GetID()); err != nil {
+					return err
+				}
+			}
+		}
+		if resp.NextPage == 0 {
+			break
+		}
+		opts.Page = resp.NextPage
+	}
+	return nil
+}
+
+// ClearOrchestratorComments deletes all comments on the issue (and PR) that were
+// posted by the orchestrator (identified by markers or prefix).
+func (c *Client) ClearOrchestratorComments(ctx context.Context, num int) error {
+	opts := &github.IssueListCommentsOptions{
+		ListOptions: github.ListOptions{PerPage: perPageDefault},
+	}
+	for {
+		comments, resp, err := c.gh.Issues.ListComments(ctx, c.owner, c.repo, num, opts)
+		if err != nil {
+			return err
+		}
+		for _, cm := range comments {
+			body := cm.GetBody()
+			isOrchestrator := strings.Contains(body, "<!-- copilot-autodev:") ||
+				strings.HasPrefix(body, "copilot-autodev:") ||
+				strings.Contains(body, "@copilot")
+
+			if isOrchestrator {
 				if _, err := c.gh.Issues.DeleteComment(ctx, c.owner, c.repo, cm.GetID()); err != nil {
 					return err
 				}

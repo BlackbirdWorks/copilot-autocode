@@ -137,6 +137,7 @@ func TestPRTask_SyncBranch(t *testing.T) {
 				Num:         tt.pr.GetNumber(),
 				Sha:         tt.pr.GetHead().GetSHA(),
 				DisplayInfo: displayInfo,
+				Manager:     &poller.AISessionManager{Slots: 1, Active: make(map[int]bool)},
 			}
 
 			stop, err := task.SyncBranch(ctx)
@@ -236,6 +237,7 @@ func TestPRTask_ApproveRuns(t *testing.T) {
 				Num:         123,
 				Sha:         "sha",
 				DisplayInfo: displayInfo,
+				Manager:     &poller.AISessionManager{Slots: 1, Active: make(map[int]bool)},
 			}
 
 			stop, err := task.ApproveRuns(ctx)
@@ -311,6 +313,7 @@ func TestPRTask_CheckGates(t *testing.T) {
 				Num:         123,
 				Sha:         "sha",
 				DisplayInfo: displayInfo,
+				Manager:     &poller.AISessionManager{Slots: 1, Active: make(map[int]bool)},
 			}
 
 			stop, err := task.CheckGates(ctx)
@@ -412,6 +415,7 @@ func TestPRTask_HandleTimeout(t *testing.T) {
 				Num:         123,
 				Sha:         "sha",
 				DisplayInfo: displayInfo,
+				Manager:     &poller.AISessionManager{Slots: 1, Active: make(map[int]bool)},
 			}
 
 			stop, err := task.HandleTimeout(ctx)
@@ -527,6 +531,7 @@ func TestPRTask_Refine(t *testing.T) {
 				Num:         123,
 				Sha:         "head-sha",
 				DisplayInfo: displayInfo,
+				Manager:     &poller.AISessionManager{Slots: 1, Active: make(map[int]bool)},
 			}
 			if tt.name == "refinement rounds exhausted" {
 				// Mock that we already sent 5 refinement prompts
@@ -611,6 +616,7 @@ func TestPRTask_Merge(t *testing.T) {
 				Num:         123,
 				Sha:         "head-sha",
 				DisplayInfo: displayInfo,
+				Manager:     &poller.AISessionManager{Slots: 1, Active: make(map[int]bool)},
 				AllOK:       tt.allOK,
 			}
 
@@ -679,6 +685,7 @@ func TestPRTask_WaitForCI(t *testing.T) {
 				Num:         123,
 				Sha:         "sha",
 				DisplayInfo: displayInfo,
+				Manager:     &poller.AISessionManager{Slots: 1, Active: make(map[int]bool)},
 			}
 			stop, err := task.WaitForCI(ctx)
 			if tt.wantErr {
@@ -825,6 +832,7 @@ func TestPRTask_FixCI(t *testing.T) {
 				Num:         123,
 				Sha:         "sha",
 				DisplayInfo: displayInfo,
+				Manager:     &poller.AISessionManager{Slots: 1, Active: make(map[int]bool)},
 				AnyFail:     true,
 			}
 
@@ -862,6 +870,7 @@ func TestPRTask_Run(t *testing.T) {
 		Num:         123,
 		Sha:         "sha",
 		DisplayInfo: displayInfo,
+		Manager:     &poller.AISessionManager{Slots: 1, Active: make(map[int]bool)},
 	}
 
 	err := task.Run(ctx)

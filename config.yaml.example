@@ -20,6 +20,45 @@ label_review: "ai-review"   # PR is open and being tested / refined
 
 # ── Agent ─────────────────────────────────────────────────────────────────────
 
+# Cloud coding agent to start new GitHub Agent HQ background tasks with.
+# Accepted: codex, claude, copilot.
+cloud_agent: "codex"
+
+# Optional low-level overrides for custom/nonstandard Agent HQ entries.
+# Leave these empty for the built-in presets above.
+# cloud_agent_login: "codex"
+# cloud_agent_mention: "@codex"
+# cloud_agent_session_id: 0
+
+# Model passed to the selected cloud agent. Use "auto" or a model supported by
+# the chosen agent, such as "gpt-5.2-codex" for OpenAI Codex.
+model: "auto"
+
+# Backend used by the orchestrator. "cloud" uses GitHub Agent HQ with
+# cloud_agent above, "claude" is a shortcut for remote GitHub Claude,
+# "local_claude" runs Claude Code locally against a clone, "cli" runs a custom
+# local CLI against a clone, and "codex" submits tasks directly to Codex Cloud.
+agent_type: "cloud"
+
+# Optional when agent_type is "local_claude". The defaults favor Opus for the
+# first implementation pass, then Sonnet for CI fixes and refinement.
+cli_agent_cmd: "claude"
+cli_agent_args:
+  - "-p"
+  - "{prompt}"
+  - "--model"
+  - "{model}"
+cli_agent_initial_model: "opus-4.7"
+cli_agent_refinement_model: "sonnet"
+cli_agent_ci_fix_model: "sonnet"
+
+# Optional when agent_type is "codex". If empty, the app tries to infer it from
+# `codex cloud list --json`; set it if you use multiple Codex Cloud environments.
+codex_cloud_env_id: ""
+codex_cloud_cmd: "codex"
+codex_cloud_attempts: 1
+# codex_cloud_branch: "main"
+
 # Maximum number of issues in the ai-coding state at the same time.
 max_concurrent_issues: 3
 
@@ -29,12 +68,12 @@ poll_interval_seconds: 45
 # ── Refinement ────────────────────────────────────────────────────────────────
 
 # Number of combined refinement+CI rounds before the PR is merged.
-# Each round asks Copilot to review its implementation AND fix any failing CI
+# Each round asks the coding agent to review its implementation AND fix any failing CI
 # checks in the same pass.  The PR is only approved and merged after all rounds
 # complete with CI green.  Set to 0 to merge as soon as CI passes.
 max_refinement_rounds: 3
 
-# The review instruction sent to @copilot each refinement round.
+# The review instruction sent to the coding agent each refinement round.
 # The orchestrator prepends the round counter, appends any CI failure details
 # (workflow name, failed job names, log URLs), and adds machine-readable markers
 # automatically.  No separate ci_fix_prompt is needed.
@@ -51,31 +90,31 @@ merge_commit_message: "Auto-merged by copilot-autocode"
 # ── Prompt templates ──────────────────────────────────────────────────────────
 
 # Comment posted when the PR branch is behind or has merge conflicts.
-merge_conflict_prompt: "@copilot Please merge from main and address any merge conflicts."
+merge_conflict_prompt: "@codex Please merge from main and address any merge conflicts."
 
 # ── Copilot invoke / nudge ─────────────────────────────────────────────────────
-# If the Copilot coding agent has not opened a PR within this many seconds
-# of being assigned, the orchestrator posts a nudge comment (@-mentioning
-# Copilot) and re-assigns it to fire a fresh trigger event.  Minimum: 30.
+# If the cloud coding agent has not opened a PR within this many seconds
+# of being assigned, the orchestrator posts a nudge comment and re-assigns it
+# to fire a fresh trigger event.  Minimum: 30.
 copilot_invoke_timeout_seconds: 600   # 10 minutes
 
 # Maximum number of nudge attempts before the issue is returned to ai-queue
 # for manual review (with an explanatory comment).
 copilot_invoke_max_retries: 3
 
-# Body of the task prompt sent directly to the Copilot API when the coding
+# Body of the task prompt sent directly to the cloud agent API when the coding
 # agent has not started within the timeout.  The following placeholders are
 # expanded at runtime:
 #   {issue_number} — the issue number (e.g. 42)
 #   {issue_title}  — the issue title
 #   {issue_url}    — the URL of the issue on GitHub
-# The prompt is passed as-is to the Copilot API (the same backend that powers
+# The prompt is passed as-is to the cloud agent API (the same backend that powers
 # the Agents tab and `gh agent-task create`); no @-mention prefix is added.
 fallback_issue_invoke_prompt: "Please start working on issue #{issue_number}: {issue_title}.\n{issue_url}"
 
 # ── Local AI merge-conflict fallback ──────────────────────────────────────────
 
-# Number of times @copilot is asked to fix merge conflicts before the
+# Number of times the coding agent is asked to fix merge conflicts before the
 # orchestrator falls back to running a local AI CLI to resolve them.
 # Set to 0 to disable @copilot retries and always use local resolution.
 max_merge_conflict_retries: 3

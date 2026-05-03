@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -25,6 +26,12 @@ const (
 	defaultLogMaxSizeMB               = 5
 	defaultLogMaxFiles                = 3
 	defaultMergeLogRetentionMinutes   = 60
+	defaultCloudAgent                 = "codex"
+	defaultLocalClaudeCmd             = "claude"
+	defaultLocalClaudeInitialModel    = "opus-4.7"
+	defaultLocalClaudeFollowupModel   = "sonnet"
+	promptPlaceholder                 = "{prompt}"
+	modelPlaceholder                  = "{model}"
 
 	minPollIntervalSecs         = 10
 	minCopilotInvokeTimeoutSecs = 30
@@ -170,10 +177,46 @@ type Config struct {
 	// Default: 60 (1 hour).
 	MergeLogRetentionMinutes int `yaml:"merge_log_retention_minutes"`
 
+	// CIMaxRetries is the number of times @copilot is asked to fix CI failures
+	// before the orchestrator stops. Default: 6.
+	CIMaxRetries int `yaml:"ci_max_retries"`
+
+	// CopilotOAuthToken is an OAuth token (gho_... or ghu_...) used for calls
+	// to the Copilot individual API (api.individual.githubcopilot.com).
+	// PATs are rejected by that API; only OAuth tokens work.
+	// If left empty, the daemon auto-discovers the token by running
+	// `gh auth token`.  Set this explicitly when the daemon cannot access the
+	// gh CLI or the macOS keychain (e.g. in headless / launchd environments).
+	// Obtain via: gh auth token
+	CopilotOAuthToken string `yaml:"copilot_oauth_token"`
+
+	// AssignInsteadOfInvoke, if true, skips the Copilot Jobs API GraphQL call
+	// and invokes the agent by posting an @copilot comment directly. Use this
+	// when the GraphQL invoke mutation returns errors. Default: false.
+	AssignInsteadOfInvoke bool `yaml:"assign_instead_of_invoke"`
+
 	// AgentType selects the coding agent backend.
-	// "cloud" (default) uses the GitHub Copilot cloud API.
+	// "cloud" (default) uses the GitHub cloud coding-agent API.
+	// "claude" is a shortcut for the GitHub Claude coding agent.
 	// "cli" uses a local CLI agent (e.g. copilot, claude, aider).
+	// "codex" uses the local Codex CLI to submit Codex Cloud tasks.
 	AgentType string `yaml:"agent_type"`
+
+	// CloudAgent selects which GitHub Agent HQ agent starts new background tasks.
+	// Accepted values: codex, claude, copilot. Default: codex.
+	CloudAgent string `yaml:"cloud_agent"`
+
+	// CloudAgentLogin is the GitHub login for the cloud coding agent to assign.
+	// Leave empty to derive it from cloud_agent.
+	CloudAgentLogin string `yaml:"cloud_agent_login"`
+
+	// CloudAgentMention is the @-mention used when falling back to comment-based
+	// invocation or follow-up prompts. Leave empty to derive it from cloud_agent.
+	CloudAgentMention string `yaml:"cloud_agent_mention"`
+
+	// CloudAgentSessionID is an optional numeric agent_id for the private
+	// follow-up session API. Leave 0 to derive it from cloud_agent.
+	CloudAgentSessionID int64 `yaml:"cloud_agent_session_id"`
 
 	// CLIAgentCmd is the executable invoked by the "cli" agent backend.
 	// Default: "copilot".
@@ -183,13 +226,47 @@ type Config struct {
 	// CLIAgentArgs are extra arguments passed to CLIAgentCmd.
 	// If the placeholder "{prompt}" appears in any argument, it is replaced
 	// with the task prompt.  Otherwise the prompt is appended at the end.
+	// If the placeholder "{model}" appears in any argument, it is replaced with
+	// the model selected for the task phase. If no model placeholder exists,
+	// generic CLI agents do not receive a model argument automatically.
 	// Default: ["-p", "{prompt}"].
 	CLIAgentArgs []string `yaml:"cli_agent_args"`
+
+	// CLIAgentInitialModel is used for first-pass local CLI coding tasks.
+	CLIAgentInitialModel string `yaml:"cli_agent_initial_model"`
+
+	// CLIAgentRefinementModel is used for local CLI refinement prompts.
+	CLIAgentRefinementModel string `yaml:"cli_agent_refinement_model"`
+
+	// CLIAgentCIFixModel is used for local CLI CI-fix prompts.
+	CLIAgentCIFixModel string `yaml:"cli_agent_ci_fix_model"`
+
+	// CLIAgentFollowupModel is used for local CLI follow-up prompt types that
+	// do not have a more specific model configured.
+	CLIAgentFollowupModel string `yaml:"cli_agent_followup_model"`
+
+	// CodexCloudCmd is the executable used for Codex Cloud mode.
+	// Default: "codex".
+	CodexCloudCmd string `yaml:"codex_cloud_cmd"`
+
+	// CodexCloudEnvID is the Codex Cloud environment identifier passed to
+	// `codex cloud exec --env`. If empty, Codex Cloud mode attempts to infer it
+	// from `codex cloud list --json`.
+	CodexCloudEnvID string `yaml:"codex_cloud_env_id"`
+
+	// CodexCloudBranch optionally selects the branch passed to Codex Cloud.
+	// If empty, Codex Cloud uses its default for the selected environment.
+	CodexCloudBranch string `yaml:"codex_cloud_branch"`
+
+	// CodexCloudAttempts is the number of assistant attempts requested for
+	// each Codex Cloud task. Default: 1.
+	CodexCloudAttempts int `yaml:"codex_cloud_attempts"`
 
 	// NotificationsEnabled controls whether desktop notifications are sent
 	// for key events (PR merged, agent timeout, manual fix needed).
 	// Default: true.
-	NotificationsEnabled bool `yaml:"notifications_enabled"`
+	NotificationsEnabled bool   `yaml:"notifications_enabled"`
+	Model                string `yaml:"model"`
 }
 
 // Load reads a YAML config file from path and returns a populated Config with
@@ -223,27 +300,31 @@ func DefaultConfig() *Config {
 		RefinementPrompt:              "Please review your implementation against all requirements in the original issue and refine anything that is missing or incomplete. Please commit and push often so you don't lose work.",
 		MergeMethod:                   "squash",
 		MergeCommitMessage:            "Auto-merged by copilot-autodev",
-		MergeConflictPrompt:           "@copilot Please merge from main and address any merge conflicts. Please commit and push often so you don't lose work.",
+		MergeConflictPrompt:           "@codex Please merge from main and address any merge conflicts. Please commit and push often so you don't lose work.",
 		MaxMergeConflictRetries:       defaultMaxMergeConflictRetries,
 		LocalMergeAttempts:            defaultLocalMergeAttempts,
 		LocalMergeDelayMinutes:        defaultLocalMergeDelayMinutes,
 		AIMergeResolverCmd:            "copilot",
-		AIMergeResolverArgs:           []string{"-p", "{prompt}", "--yolo"},
+		AIMergeResolverArgs:           []string{"-p", promptPlaceholder, "--yolo"},
 		AIMergeResolverPrompt:         "Please resolve all git merge conflicts in this repository. Make minimal changes to resolve the conflicts while preserving the intent of both sides.",
 		CopilotInvokeTimeoutSeconds:   defaultCopilotInvokeTimeoutSecs,
 		CopilotInvokeMaxRetries:       defaultCopilotInvokeMaxRetries,
-		FallbackIssueInvokePrompt:     "Please start working on issue #{issue_number}: {issue_title}.\n{issue_url}\n\nPlease commit and push often so you don't lose work.",
+		FallbackIssueInvokePrompt:     "Please start working on issue #{issue_number}: {issue_title}.\n{issue_url}\n\nPlease make a pull request with your changes. Please commit and push often so you don't lose work.",
 		AgentTimeoutRetryDelaySeconds: defaultAgentTimeoutRetryDelaySecs,
-		AgentContinuePrompt:           "@copilot continue. Please commit and push often so you don't lose work.",
+		AgentContinuePrompt:           "@codex continue. Please commit and push often so you don't lose work.",
 		MaxAgentContinueRetries:       defaultMaxAgentContinueRetries,
 		MaxCIFixRounds:                defaultMaxCIFixRounds,
 		LogMaxSizeMB:                  defaultLogMaxSizeMB,
 		LogMaxFiles:                   defaultLogMaxFiles,
 		MergeLogRetentionMinutes:      defaultMergeLogRetentionMinutes,
 		AgentType:                     "cloud",
+		CloudAgent:                    defaultCloudAgent,
 		CLIAgentCmd:                   "copilot",
-		CLIAgentArgs:                  []string{"-p", "{prompt}"},
+		CLIAgentArgs:                  []string{"-p", promptPlaceholder},
+		CodexCloudCmd:                 "codex",
+		CodexCloudAttempts:            1,
 		NotificationsEnabled:          true,
+		Model:                         "auto",
 	}
 }
 
@@ -306,6 +387,100 @@ func (c *Config) validate() error {
 	}
 	if c.LogMaxFiles < 1 {
 		c.LogMaxFiles = defaultLogMaxFiles
+	}
+	c.applyAgentTypePreset()
+	if err := c.applyCloudAgentPreset(); err != nil {
+		return err
+	}
+	if c.CodexCloudCmd == "" {
+		c.CodexCloudCmd = "codex"
+	}
+	if c.CodexCloudAttempts < 1 {
+		c.CodexCloudAttempts = 1
+	}
+	return nil
+}
+
+func (c *Config) applyAgentTypePreset() {
+	switch strings.ToLower(strings.TrimSpace(c.AgentType)) {
+	case "local_claude", "claude_local", "claude-code":
+		c.AgentType = "cli"
+		c.CLIAgentCmd = defaultLocalClaudeCmd
+		c.CLIAgentArgs = ensureLocalClaudeArgs(c.CLIAgentArgs)
+		if c.CLIAgentInitialModel == "" {
+			c.CLIAgentInitialModel = defaultLocalClaudeInitialModel
+		}
+		if c.CLIAgentFollowupModel == "" {
+			c.CLIAgentFollowupModel = defaultLocalClaudeFollowupModel
+		}
+		if c.CLIAgentRefinementModel == "" {
+			c.CLIAgentRefinementModel = c.CLIAgentFollowupModel
+		}
+		if c.CLIAgentCIFixModel == "" {
+			c.CLIAgentCIFixModel = c.CLIAgentFollowupModel
+		}
+	case defaultLocalClaudeCmd:
+		c.AgentType = defaultLocalClaudeCmd
+		c.CloudAgent = defaultLocalClaudeCmd
+		c.CloudAgentLogin = ""
+		c.CloudAgentMention = ""
+		c.CloudAgentSessionID = 0
+	}
+}
+
+func ensureLocalClaudeArgs(args []string) []string {
+	if len(args) == 0 {
+		return []string{"-p", promptPlaceholder, "--model", modelPlaceholder}
+	}
+	hasPrompt := false
+	hasModel := false
+	for _, arg := range args {
+		if strings.Contains(arg, promptPlaceholder) {
+			hasPrompt = true
+		}
+		if strings.Contains(arg, modelPlaceholder) {
+			hasModel = true
+		}
+	}
+	if !hasPrompt {
+		args = append(args, promptPlaceholder)
+	}
+	if !hasModel {
+		args = append(args, "--model", modelPlaceholder)
+	}
+	return args
+}
+
+func (c *Config) applyCloudAgentPreset() error {
+	agent := strings.ToLower(strings.TrimSpace(c.CloudAgent))
+	if agent == "" {
+		agent = defaultCloudAgent
+	}
+	var login, mention string
+	var sessionID int64
+	switch agent {
+	case "codex":
+		login, mention = "codex", "@codex"
+	case defaultLocalClaudeCmd:
+		login, mention = defaultLocalClaudeCmd, "@claude"
+	case "copilot":
+		login, mention, sessionID = "copilot-swe-agent", "@copilot", 1143301
+	default:
+		return fmt.Errorf("config: cloud_agent must be codex, claude, or copilot (got %q)", c.CloudAgent)
+	}
+
+	c.CloudAgent = agent
+	if c.CloudAgentLogin == "" {
+		c.CloudAgentLogin = login
+	}
+	if c.CloudAgentMention == "" {
+		c.CloudAgentMention = mention
+	}
+	if c.CloudAgentSessionID == 0 {
+		c.CloudAgentSessionID = sessionID
+	}
+	if !strings.HasPrefix(c.CloudAgentMention, "@") {
+		c.CloudAgentMention = "@" + c.CloudAgentMention
 	}
 	return nil
 }

@@ -75,7 +75,7 @@ func TestCloudAgent_IsActive(t *testing.T) {
 			cfg.GitHubOwner = "owner"
 			cfg.GitHubRepo = "repo"
 			client := ghclient.NewWithTransport("token", cfg, rt)
-			ag := agent.NewCloudAgent(client)
+			ag := agent.NewCloudAgent(client, cfg)
 
 			assert.Equal(t, tt.expected, ag.IsActive(ctx, 123, "branch"))
 		})
@@ -191,7 +191,7 @@ func TestCloudAgent_HasRespondedSince_And_DiscoverPR(t *testing.T) {
 	cfg.GitHubOwner = "owner"
 	cfg.GitHubRepo = "repo"
 	client := ghclient.NewWithTransport("token", cfg, rt)
-	ag := agent.NewCloudAgent(client)
+	ag := agent.NewCloudAgent(client, cfg)
 
 	has, err := ag.HasRespondedSince(ctx, 123, time.Now().Add(-time.Hour))
 	require.NoError(t, err)
@@ -214,7 +214,6 @@ func setupCloudAgent(t *testing.T, handler http.HandlerFunc) agent.CodingAgent {
 	}
 	cfg := config.DefaultConfig()
 	cfg.GitHubOwner = "owner"
-	cfg.GitHubRepo = "repo"
 	client := ghclient.NewWithTransport("token", cfg, rt)
-	return agent.NewCloudAgent(client)
+	return agent.NewCloudAgent(client, cfg)
 }

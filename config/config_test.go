@@ -53,6 +53,12 @@ func TestConfigLoad(t *testing.T) {
 				assert.Equal(t, []string{"-p", "{prompt}", "--yolo"}, c.AIMergeResolverArgs)
 				assert.Equal(t, 600, c.CopilotInvokeTimeoutSeconds)
 				assert.Equal(t, 3, c.CopilotInvokeMaxRetries)
+				assert.Equal(t, "codex", c.CloudAgent)
+				assert.Equal(t, "codex", c.CloudAgentLogin)
+				assert.Equal(t, "@codex", c.CloudAgentMention)
+				assert.Equal(t, int64(0), c.CloudAgentSessionID)
+				assert.Equal(t, "codex", c.CodexCloudCmd)
+				assert.Equal(t, 1, c.CodexCloudAttempts)
 				assert.NotEmpty(t, c.FallbackIssueInvokePrompt)
 				assert.Contains(t, c.FallbackIssueInvokePrompt, "{issue_number}")
 			},
@@ -67,6 +73,7 @@ max_concurrent_issues: 5
 poll_interval_seconds: 120
 copilot_invoke_timeout_seconds: 300
 copilot_invoke_max_retries: 2
+cloud_agent: copilot
 label_queue: custom-queue
 `,
 			check: func(t *testing.T, c *config.Config) {
@@ -75,7 +82,86 @@ label_queue: custom-queue
 				assert.Equal(t, 120, c.PollIntervalSeconds)
 				assert.Equal(t, 300, c.CopilotInvokeTimeoutSeconds)
 				assert.Equal(t, 2, c.CopilotInvokeMaxRetries)
+				assert.Equal(t, "copilot", c.CloudAgent)
+				assert.Equal(t, "copilot-swe-agent", c.CloudAgentLogin)
+				assert.Equal(t, "@copilot", c.CloudAgentMention)
+				assert.Equal(t, int64(1143301), c.CloudAgentSessionID)
 				assert.Equal(t, "custom-queue", c.LabelQueue)
+			},
+		},
+		{
+			name: "claude cloud agent preset",
+			yaml: "github_owner: o\ngithub_repo: r\ncloud_agent: claude\n",
+			check: func(t *testing.T, c *config.Config) {
+				assert.Equal(t, "claude", c.CloudAgent)
+				assert.Equal(t, "claude", c.CloudAgentLogin)
+				assert.Equal(t, "@claude", c.CloudAgentMention)
+				assert.Equal(t, int64(0), c.CloudAgentSessionID)
+			},
+		},
+		{
+			name: "claude agent type uses github claude",
+			yaml: "github_owner: o\ngithub_repo: r\nagent_type: claude\ncloud_agent_login: codex\ncloud_agent_mention: '@codex'\ncloud_agent_session_id: 1143301\n",
+			check: func(t *testing.T, c *config.Config) {
+				assert.Equal(t, "claude", c.AgentType)
+				assert.Equal(t, "claude", c.CloudAgent)
+				assert.Equal(t, "claude", c.CloudAgentLogin)
+				assert.Equal(t, "@claude", c.CloudAgentMention)
+				assert.Equal(t, int64(0), c.CloudAgentSessionID)
+			},
+		},
+		{
+			name: "local claude shortcut uses claude code CLI with phased models",
+			yaml: "github_owner: o\ngithub_repo: r\nagent_type: local_claude\n",
+			check: func(t *testing.T, c *config.Config) {
+				assert.Equal(t, "cli", c.AgentType)
+				assert.Equal(t, "claude", c.CLIAgentCmd)
+				assert.Equal(t, []string{"-p", "{prompt}", "--model", "{model}"}, c.CLIAgentArgs)
+				assert.Equal(t, "opus-4.7", c.CLIAgentInitialModel)
+				assert.Equal(t, "sonnet", c.CLIAgentFollowupModel)
+				assert.Equal(t, "sonnet", c.CLIAgentRefinementModel)
+				assert.Equal(t, "sonnet", c.CLIAgentCIFixModel)
+			},
+		},
+		{
+			name: "local claude shortcut preserves custom model choices",
+			yaml: `
+github_owner: o
+github_repo: r
+agent_type: claude_local
+cli_agent_args: ["--dangerously-skip-permissions", "-p", "{prompt}"]
+cli_agent_initial_model: "opus-4.7"
+cli_agent_refinement_model: "sonnet"
+cli_agent_ci_fix_model: "sonnet"
+`,
+			check: func(t *testing.T, c *config.Config) {
+				assert.Equal(t, "cli", c.AgentType)
+				assert.Equal(t, "claude", c.CLIAgentCmd)
+				assert.Equal(
+					t,
+					[]string{"--dangerously-skip-permissions", "-p", "{prompt}", "--model", "{model}"},
+					c.CLIAgentArgs,
+				)
+				assert.Equal(t, "opus-4.7", c.CLIAgentInitialModel)
+				assert.Equal(t, "sonnet", c.CLIAgentRefinementModel)
+				assert.Equal(t, "sonnet", c.CLIAgentCIFixModel)
+			},
+		},
+		{
+			name: "codex backend allows env auto-discovery",
+			yaml: "github_owner: o\ngithub_repo: r\nagent_type: codex\n",
+			check: func(t *testing.T, c *config.Config) {
+				assert.Equal(t, "codex", c.AgentType)
+				assert.Empty(t, c.CodexCloudEnvID)
+			},
+		},
+		{
+			name: "codex backend config",
+			yaml: "github_owner: o\ngithub_repo: r\nagent_type: codex\ncodex_cloud_env_id: env_123\ncodex_cloud_attempts: 2\n",
+			check: func(t *testing.T, c *config.Config) {
+				assert.Equal(t, "codex", c.AgentType)
+				assert.Equal(t, "env_123", c.CodexCloudEnvID)
+				assert.Equal(t, 2, c.CodexCloudAttempts)
 			},
 		},
 		{

@@ -22,6 +22,49 @@ import (
 	"github.com/BlackbirdWorks/copilot-autodev/resolver"
 )
 
+// AISessionManager tracks and limits concurrent AI activity across the entire
+// repository. It ensures that the number of issues actively using an AI
+// (on GitHub via agents or locally via merge resolution) does not exceed
+// MaxConcurrentIssues.
+type AISessionManager struct {
+	mu     sync.Mutex
+	Active map[int]bool
+	Slots  int
+}
+
+// TryAcquire attempts to claim an AI session slot for the given issue.
+// Returns true if the issue already has a session or if a new slot was available.
+func (m *AISessionManager) TryAcquire(issueNum int) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.Active[issueNum] {
+		return true
+	}
+	if m.Slots > 0 {
+		m.Slots--
+		m.Active[issueNum] = true
+		return true
+	}
+	return false
+}
+
+// IsActive returns true if the issue is already recorded as having an active AI session.
+func (m *AISessionManager) IsActive(issueNum int) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.Active[issueNum]
+}
+
+// Release removes the issue from the active set.
+func (m *AISessionManager) Release(issueNum int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.Active[issueNum] {
+		delete(m.Active, issueNum)
+		m.Slots++
+	}
+}
+
 // IssueDisplayInfo holds the human-readable status for one issue, computed
 // entirely from live GitHub data during a single tick (never persisted between
 // ticks).  This keeps the app stateless: restarting it produces exactly the
@@ -73,7 +116,7 @@ type Event struct {
 
 // Command is a request sent from the TUI (or other callers) to the Poller.
 type Command struct {
-	Action   string // "retry-merge" | "takeover" | "rerun-ci" | "priority-up" | "priority-down" | "retry-task" | "clean-workdir" | "clean-all"
+	Action   string // "retry-merge" | "takeover" | "rerun-ci" | "priority-up" | "priority-down" | "retry-task" | "reset-issue" | "clean-workdir" | "clean-all"
 	PRNum    int    // the PR number to act on (used by retry-merge, rerun-ci)
 	IssueNum int    // the issue number to act on (used by takeover, priority-up/down, retry-task, clean-workdir)
 }
@@ -145,6 +188,8 @@ func (p *Poller) HandleCommand(ctx context.Context, cmd Command) {
 		p.retryMergeResolution(ctx, cmd.PRNum)
 	case "retry-task":
 		p.retryTask(ctx, cmd.IssueNum)
+	case "reset-issue":
+		p.resetIssue(ctx, cmd.IssueNum)
 	case "takeover":
 		p.takeoverIssue(ctx, cmd.IssueNum)
 	case "rerun-ci":
@@ -169,6 +214,53 @@ func (p *Poller) retryTask(ctx context.Context, issueNum int) {
 		logger.Load(ctx).ErrorContext(ctx, "retry task failed",
 			slog.Int("issue", issueNum), slog.Any("err", err))
 	}
+}
+
+// resetIssue clears all orchestrator comments, resets labels, and cleans workdir.
+func (p *Poller) resetIssue(ctx context.Context, issueNum int) {
+	logger.Load(ctx).InfoContext(ctx, "resetting issue", slog.Int("issue", issueNum))
+
+	// 1. Find the issue to get its current labels.
+	issue, _, err := p.gh.GH().Issues.Get(ctx, p.gh.Owner(), p.gh.Repo(), issueNum)
+	if err != nil {
+		logger.Load(ctx).ErrorContext(ctx, "failed to get issue for reset",
+			slog.Int("issue", issueNum), slog.Any("err", err))
+		return
+	}
+
+	// 2. Clear comments on the issue.
+	if err := p.gh.ClearOrchestratorComments(ctx, issueNum); err != nil {
+		logger.Load(ctx).ErrorContext(ctx, "failed to clear orchestrator comments",
+			slog.Int("issue", issueNum), slog.Any("err", err))
+	}
+
+	// 3. Find and clear comments on linked PR.
+	pr, err := p.gh.OpenPRForIssue(ctx, issue)
+	if err == nil && pr != nil {
+		if err := p.gh.ClearOrchestratorComments(ctx, pr.GetNumber()); err != nil {
+			logger.Load(ctx).ErrorContext(ctx, "failed to clear PR comments during reset",
+				slog.Int("pr", pr.GetNumber()), slog.Any("err", err))
+		}
+	}
+
+	// 4. Reset labels.
+	// Remove all ai-* labels and add ai-queue.
+	for _, l := range issue.Labels {
+		name := l.GetName()
+		if strings.HasPrefix(name, "ai-") || name == p.gh.LabelTakeover() {
+			if err := p.gh.RemoveLabel(ctx, issueNum, name); err != nil {
+				logger.Load(ctx).WarnContext(ctx, "failed to remove label during reset",
+					slog.Int("issue", issueNum), slog.String("label", name), slog.Any("err", err))
+			}
+		}
+	}
+	if err := p.gh.AddLabel(ctx, issueNum, p.gh.LabelQueue()); err != nil {
+		logger.Load(ctx).ErrorContext(ctx, "failed to add queue label during reset",
+			slog.Int("issue", issueNum), slog.Any("err", err))
+	}
+
+	// 5. Cleanup workdir.
+	p.agent.CleanupWorkdir(ctx, issueNum)
 }
 
 // cleanWorkdir removes the persistent working directory for a single issue.
@@ -344,12 +436,13 @@ func (p *Poller) Tick(ctx context.Context) {
 	var wg sync.WaitGroup
 
 	// Phase 2+2.5: coding issues.
+	manager := p.IdentifyActiveSessions(ctx, coding, reviewing)
 	for _, issue := range coding {
 		wg.Add(1)
 		go func(i *github.Issue) {
 			defer wg.Done()
 			local := make(map[int]*IssueDisplayInfo)
-			if gErr := p.ProcessCodingIssue(ctx, i, local); gErr != nil {
+			if gErr := p.ProcessCodingIssue(ctx, i, local, manager); gErr != nil {
 				logger.Load(ctx).ErrorContext(ctx, "error processing coding issue",
 					slog.Int("issue", i.GetNumber()), slog.Any("err", gErr))
 			}
@@ -365,7 +458,7 @@ func (p *Poller) Tick(ctx context.Context) {
 		go func(i *github.Issue) {
 			defer wg.Done()
 			local := make(map[int]*IssueDisplayInfo)
-			if gErr := p.ProcessOne(ctx, i, local); gErr != nil {
+			if gErr := p.ProcessOne(ctx, i, local, manager); gErr != nil {
 				logger.Load(ctx).ErrorContext(ctx, "error processing issue",
 					slog.Int("issue", i.GetNumber()), slog.Any("err", gErr))
 			}
@@ -384,7 +477,10 @@ func (p *Poller) Tick(ctx context.Context) {
 	}
 
 	// Phase 1: Queue → Coding.
-	if err := p.PromoteFromQueue(ctx, queue); err != nil {
+	// We use the counts from the start of the tick (before any swaps or closures)
+	// to determine available slots. This is safer than re-fetching labels from
+	// GitHub, which can be inconsistent due to search index lag.
+	if err := p.PromoteFromQueue(ctx, queue, len(coding), len(reviewing), manager); err != nil {
 		evt.Err = fmt.Errorf("promote from queue: %w", err)
 	}
 
@@ -408,15 +504,67 @@ func (p *Poller) Tick(ctx context.Context) {
 	}
 }
 
+// IdentifyActiveSessions checks all coding and reviewing issues to see which
+// ones already have an active AI session (GitHub agent or local merge).
+func (p *Poller) IdentifyActiveSessions(
+	ctx context.Context,
+	coding, reviewing []*github.Issue,
+) *AISessionManager {
+	manager := &AISessionManager{
+		Active: make(map[int]bool),
+		Slots:  p.cfg.MaxConcurrentIssues,
+	}
+	var wg sync.WaitGroup
+
+	check := func(i *github.Issue) {
+		defer wg.Done()
+		num := i.GetNumber()
+		if p.IsMerging(num) {
+			manager.mu.Lock()
+			if !manager.Active[num] && manager.Slots > 0 {
+				manager.Active[num] = true
+				manager.Slots--
+			}
+			manager.mu.Unlock()
+			return
+		}
+
+		// Logic similar to IsAgentActive but optimized if possible.
+		// Cloud agent IsActive checks are fast (cached or metadata-only).
+		// We use a safe branch name guess if PR is not yet in Snapshot.
+		branch := fmt.Sprintf("copilot-autodev/issue-%d", num)
+		if p.IsAgentActive(ctx, num, branch) {
+			manager.mu.Lock()
+			if !manager.Active[num] && manager.Slots > 0 {
+				manager.Active[num] = true
+				manager.Slots--
+			}
+			manager.mu.Unlock()
+		}
+	}
+
+	for _, i := range coding {
+		wg.Add(1)
+		go check(i)
+	}
+	for _, i := range reviewing {
+		wg.Add(1)
+		go check(i)
+	}
+	wg.Wait()
+	return manager
+}
+
 // PromoteFromQueue moves issues from ai-queue → ai-coding up to the concurrency limit.
-func (p *Poller) PromoteFromQueue(ctx context.Context, queue []*github.Issue) error {
-	var nCoding, nReview int
-	if coding, err := p.gh.IssuesByLabel(ctx, p.cfg.LabelCoding); err == nil {
-		nCoding = len(coding)
-	}
-	if reviewing, err := p.gh.IssuesByLabel(ctx, p.cfg.LabelReview); err == nil {
-		nReview = len(reviewing)
-	}
+// It takes the current counts of coding and reviewing issues from the start of
+// the tick to avoid race conditions caused by eventual consistency in GitHub's
+// search index after label swaps.
+func (p *Poller) PromoteFromQueue(
+	ctx context.Context,
+	queue []*github.Issue,
+	nCoding, nReview int,
+	manager *AISessionManager,
+) error {
 	slots := p.cfg.MaxConcurrentIssues - (nCoding + nReview)
 	if slots <= 0 {
 		return nil
@@ -444,8 +592,34 @@ func (p *Poller) PromoteFromQueue(ctx context.Context, queue []*github.Issue) er
 				slog.Int("issue", num), slog.Any("err", err))
 			continue
 		}
+
+		if !manager.TryAcquire(num) {
+			logger.Load(ctx).InfoContext(ctx, "at AI session limit; swapping label but skipping invoke",
+				slog.Int("issue", num))
+			continue
+		}
+
 		prompt := FormatFallbackPrompt(p.cfg.FallbackIssueInvokePrompt, issue)
-		jobID, capiErr := p.agent.InvokeTask(ctx, prompt, issue.GetTitle(), num, issue.GetHTMLURL())
+		var jobID string
+		var capiErr error
+		if p.cfg.AssignInsteadOfInvoke {
+			// Workaround for CAPI 400 errors: assign the issue and post a comment.
+			assignErr := p.gh.AssignIssue(ctx, num, "github-copilot")
+			if assignErr != nil {
+				logger.Load(ctx).WarnContext(ctx, "failed to assign github-copilot (continuing anyway)",
+					slog.Int("issue", num), slog.Any("err", assignErr))
+			}
+			
+			triggerComment := fmt.Sprintf("@copilot %s", prompt)
+			if err := p.gh.PostComment(ctx, num, triggerComment); err != nil {
+				logger.Load(ctx).ErrorContext(ctx, "could not post assignment trigger comment",
+					slog.Int("issue", num), slog.Any("err", err))
+			}
+			// capiErr remains nil so we don't log "could not invoke copilot agent"
+		} else {
+			jobID, capiErr = p.agent.InvokeTask(ctx, prompt, issue.GetTitle(), num, issue.GetHTMLURL())
+		}
+
 		if capiErr != nil {
 			logger.Load(ctx).ErrorContext(ctx, "could not invoke copilot agent",
 				slog.Int("issue", num), slog.Any("err", capiErr))
@@ -472,6 +646,7 @@ func (p *Poller) ProcessCodingIssue(
 	ctx context.Context,
 	issue *github.Issue,
 	displayInfo map[int]*IssueDisplayInfo,
+	manager *AISessionManager,
 ) error {
 	num := issue.GetNumber()
 	pr, err := p.gh.OpenPRForIssue(ctx, issue)
@@ -483,7 +658,7 @@ func (p *Poller) ProcessCodingIssue(
 		if _, ok := displayInfo[num]; !ok {
 			displayInfo[num] = &IssueDisplayInfo{PR: pr}
 		}
-		return p.ProcessCodingPR(ctx, pr, num, displayInfo)
+		return p.ProcessCodingPR(ctx, pr, num, displayInfo, manager)
 	}
 
 	mergedPR, mErr := p.gh.MergedPRForIssue(ctx, issue)
@@ -504,6 +679,7 @@ func (p *Poller) ProcessCodingIssue(
 		issue,
 		displayInfo,
 		time.Duration(p.cfg.CopilotInvokeTimeoutSeconds)*time.Second,
+		manager,
 	)
 }
 
@@ -513,6 +689,7 @@ func (p *Poller) ProcessCodingPR(
 	pr *github.PullRequest,
 	num int,
 	displayInfo map[int]*IssueDisplayInfo,
+	manager *AISessionManager,
 ) error {
 	sha := pr.GetHead().GetSHA()
 	running, err := p.gh.AnyWorkflowRunActive(ctx, sha)
@@ -530,7 +707,7 @@ func (p *Poller) ProcessCodingPR(
 		return nil
 	}
 	if p.gh.IsPRDraft(pr) {
-		return p.ProcessDraftPR(ctx, pr, num, displayInfo)
+		return p.ProcessDraftPR(ctx, pr, num, displayInfo, manager)
 	}
 	return p.gh.SwapLabel(ctx, num, p.cfg.LabelCoding, p.cfg.LabelReview)
 }
@@ -541,8 +718,16 @@ func (p *Poller) ProcessDraftPR(
 	pr *github.PullRequest,
 	num int,
 	displayInfo map[int]*IssueDisplayInfo,
+	manager *AISessionManager,
 ) error {
-	t := &PRTask{P: p, PR: pr, Num: num, Sha: pr.GetHead().GetSHA(), DisplayInfo: displayInfo}
+	t := &PRTask{
+		P:           p,
+		PR:          pr,
+		Num:         num,
+		Sha:         pr.GetHead().GetSHA(),
+		DisplayInfo: displayInfo,
+		Manager:     manager,
+	}
 	if stop, err := t.HandleTimeout(ctx); err != nil || stop {
 		return err
 	}
@@ -573,6 +758,7 @@ func (p *Poller) NudgeSingleCodingIssue(
 	issue *github.Issue,
 	displayInfo map[int]*IssueDisplayInfo,
 	timeout time.Duration,
+	manager *AISessionManager,
 ) error {
 	num := issue.GetNumber()
 	displayInfo[num] = &IssueDisplayInfo{
@@ -604,6 +790,16 @@ func (p *Poller) NudgeSingleCodingIssue(
 	}
 	if lastActivity.IsZero() {
 		lastActivity = timeNow()
+	}
+
+	engaged, reactedAt, _ := p.gh.CopilotEngagementStatus(ctx, num)
+	if engaged && time.Since(reactedAt) < time.Hour {
+		displayInfo[num] = &IssueDisplayInfo{
+			Current:     "Agent acknowledged, queued",
+			Next:        "Waiting for agent to finish queued job",
+			AgentStatus: "pending",
+		}
+		return nil
 	}
 
 	deadline := lastActivity.Add(timeout)
@@ -645,6 +841,15 @@ func (p *Poller) NudgeSingleCodingIssue(
 		displayInfo[num] = &IssueDisplayInfo{
 			Current:     "Agent actively running — waiting",
 			Next:        "Re-check next poll",
+			AgentStatus: "pending",
+		}
+		return nil
+	}
+
+	if !manager.TryAcquire(num) {
+		displayInfo[num] = &IssueDisplayInfo{
+			Current:     "At AI session limit — waiting to nudge",
+			Next:        "Nudge when session slot available",
 			AgentStatus: "pending",
 		}
 		return nil
@@ -757,6 +962,18 @@ func (p *Poller) WaitForAgentCycle(
 ) {
 	lastContinue, _ := p.gh.LastAgentContinueAt(ctx, pr.GetNumber())
 	lastActivity := latestOf(postedAt, lastContinue)
+
+	engaged, reactedAt, _ := p.gh.CopilotEngagementStatus(ctx, pr.GetNumber())
+	if engaged && time.Since(reactedAt) < time.Hour {
+		displayInfo[num] = &IssueDisplayInfo{
+			Current:     current + " (Agent acknowledged, queued)",
+			Next:        "Waiting for agent to finish queued job",
+			PR:          pr,
+			AgentStatus: "pending",
+		}
+		return
+	}
+
 	if p.HandleAgentTimeout(ctx, pr, num, lastActivity, cfg, displayInfo) {
 		return
 	}
@@ -831,6 +1048,7 @@ func (p *Poller) ProcessOne(
 	ctx context.Context,
 	issue *github.Issue,
 	displayInfo map[int]*IssueDisplayInfo,
+	manager *AISessionManager,
 ) error {
 	pr, err := p.gh.OpenPRForIssue(ctx, issue)
 	if err != nil {
@@ -848,6 +1066,7 @@ func (p *Poller) ProcessOne(
 		Num:         issue.GetNumber(),
 		Sha:         pr.GetHead().GetSHA(),
 		DisplayInfo: displayInfo,
+		Manager:     manager,
 	}
 	return t.Run(ctx)
 }

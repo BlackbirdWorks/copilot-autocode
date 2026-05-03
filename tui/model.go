@@ -536,6 +536,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, cmd
 
 		// Cleanup.
+		case "z":
+			var cmd tea.Cmd
+			m, cmd = m.handleReset()
+			return m, cmd
 		case "x":
 			var cmd tea.Cmd
 			m, cmd = m.handleCleanWorkdir()
@@ -703,6 +707,23 @@ func (m Model) handleCleanAll() (Model, tea.Cmd) {
 	}
 	m.commandCh <- poller.Command{Action: "clean-all"}
 	m.actionFeedback = "Cleaning all workdirs and merge logs..."
+	return m, tea.Tick(
+		tuiCopyFeedbackDuration,
+		func(_ time.Time) tea.Msg { return clearActionMsg{} },
+	)
+}
+
+// handleReset sends a reset command for the selected item.
+func (m Model) handleReset() (Model, tea.Cmd) {
+	s := m.selectedState()
+	if s == nil || m.commandCh == nil {
+		return m, nil
+	}
+	m.commandCh <- poller.Command{
+		Action:   "reset-issue",
+		IssueNum: s.Issue.GetNumber(),
+	}
+	m.actionFeedback = fmt.Sprintf("Reset requested for issue #%d", s.Issue.GetNumber())
 	return m, tea.Tick(
 		tuiCopyFeedbackDuration,
 		func(_ time.Time) tea.Msg { return clearActionMsg{} },
@@ -1113,7 +1134,7 @@ func (m Model) View() string {
 	logBox := logBoxStyle.Width(logBoxWidth).Height(tuiLogBoxHeight).Render(logContent)
 
 	copyText := dimItemStyle.Render(
-		"[enter] detail  [a] timeline  [t] takeover  [f] rerun CI  [r] retry  [x/X] clean  [+/-] priority  [v/L] logs",
+		"[enter] detail  [a] timeline  [t] takeover  [f] rerun CI  [r] retry  [z] reset  [x/X] clean  [+/-] priority  [v/L] logs",
 	)
 	if m.logsCopied {
 		copyText = lipgloss.NewStyle().

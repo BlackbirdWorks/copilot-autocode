@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -51,7 +52,7 @@ func TestInvokeCopilotAgent(t *testing.T) {
 			wantErr:       false,
 			wantJobID:     "abc-123",
 			wantTitle:     "[copilot-autodev] #42: Add CloudWatch support",
-			wantPrompt:    "Please implement issue #42",
+			wantPrompt:    "Please implement issue #42\n\nFixes #42. Please make a pull request with your changes.",
 			wantEventType: "copilot-autodev",
 			wantIssueNum:  42,
 			wantIssueURL:  "https://github.com/org/repo/issues/42",
@@ -67,7 +68,7 @@ func TestInvokeCopilotAgent(t *testing.T) {
 			wantErr:       false,
 			wantJobID:     "xyz-789",
 			wantTitle:     "[copilot-autodev] #7: Fix nil pointer",
-			wantPrompt:    "Fix the bug in issue #7",
+			wantPrompt:    "Fix the bug in issue #7\n\nFixes #7. Please make a pull request with your changes.",
 			wantEventType: "copilot-autodev",
 			wantIssueNum:  7,
 			wantIssueURL:  "https://github.com/org/repo/issues/7",
@@ -82,7 +83,7 @@ func TestInvokeCopilotAgent(t *testing.T) {
 			wantErr:       false,
 			wantJobID:     "",
 			wantTitle:     "[copilot-autodev] #1: Task",
-			wantPrompt:    "Do something",
+			wantPrompt:    "Do something\n\nFixes #1. Please make a pull request with your changes.",
 			wantEventType: "copilot-autodev",
 			wantIssueNum:  1,
 		},
@@ -117,9 +118,8 @@ func TestInvokeCopilotAgent(t *testing.T) {
 				return resp, nil
 			})
 
-			jobID, err := c.InvokeAgentAt(
+			jobID, err := c.InvokeCopilotAgent(
 				t.Context(),
-				"https://api.githubcopilot.com/agents/swe/v1/jobs/test-owner/test-repo",
 				tc.prompt, tc.issueTitle, tc.issueNum, tc.issueURL,
 			)
 
@@ -887,7 +887,7 @@ func TestLatestCopilotJobID(t *testing.T) {
 				_ = json.NewEncoder(w).Encode(tc.comments)
 			})
 
-			jobID, err := c.LatestCopilotJobID(t.Context(), 1)
+			jobID, _, err := c.LatestCopilotJobID(t.Context(), 1)
 			require.NoError(t, err)
 			assert.Equal(t, tc.wantJobID, jobID)
 		})
@@ -1942,4 +1942,32 @@ func TestHasAgentCommentSince(t *testing.T) {
 			assert.Equal(t, tt.wants.want, got)
 		})
 	}
+}
+
+func TestClearOrchestratorComments(t *testing.T) {
+	t.Parallel()
+	var deletedIDs []int64
+	c := setupMockGitHubAPI(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/comments") {
+			comments := []*github.IssueComment{
+				{ID: github.Ptr(int64(1)), Body: github.Ptr("User comment")},
+				{ID: github.Ptr(int64(2)), Body: github.Ptr("<!-- copilot-autodev:marker -->")},
+				{ID: github.Ptr(int64(3)), Body: github.Ptr("copilot-autodev: notice")},
+				{ID: github.Ptr(int64(4)), Body: github.Ptr("@copilot do something")},
+			}
+			_ = json.NewEncoder(w).Encode(comments)
+			return
+		}
+		if r.Method == http.MethodDelete && strings.Contains(r.URL.Path, "/comments/") {
+			parts := strings.Split(r.URL.Path, "/")
+			id, _ := strconv.ParseInt(parts[len(parts)-1], 10, 64)
+			deletedIDs = append(deletedIDs, id)
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+	})
+
+	err := c.ClearOrchestratorComments(t.Context(), 42)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []int64{2, 3, 4}, deletedIDs)
 }

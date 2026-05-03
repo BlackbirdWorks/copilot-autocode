@@ -92,18 +92,38 @@ func TestPRTask_ResolveConflictsLocally(t *testing.T) {
 			expectStatus: "Running local AI merge resolution",
 		},
 		{
-			name:     "already resolved successfully",
+			name:     "already resolved successfully (fresh)",
 			attempts: 2,
 			setupMock: func(w http.ResponseWriter, r *http.Request) {
 				if strings.Contains(r.URL.Path, "/repos/test-owner/test-repo/issues/123/comments") {
 					marker := ghclient.SHAMarker("local-resolution-success", "head-sha")
 					comments := []*github.IssueComment{
-						{Body: github.Ptr(marker)},
+						{
+							Body:      github.Ptr(marker),
+							CreatedAt: &github.Timestamp{Time: time.Now()},
+						},
 					}
 					json.NewEncoder(w).Encode(comments)
 				}
 			},
 			expectStatus: "Merge resolved locally",
+		},
+		{
+			name:     "resolved successfully but timed out (stuck dirty)",
+			attempts: 2,
+			setupMock: func(w http.ResponseWriter, r *http.Request) {
+				if strings.Contains(r.URL.Path, "/repos/test-owner/test-repo/issues/123/comments") {
+					marker := ghclient.SHAMarker("local-resolution-success", "head-sha")
+					comments := []*github.IssueComment{
+						{
+							Body:      github.Ptr(marker),
+							CreatedAt: &github.Timestamp{Time: time.Now().Add(-5 * time.Minute)},
+						},
+					}
+					json.NewEncoder(w).Encode(comments)
+				}
+			},
+			expectStatus: "Running local AI merge resolution",
 		},
 		{
 			name:     "agent active on CAPI",
@@ -156,7 +176,7 @@ func TestPRTask_ResolveConflictsLocally(t *testing.T) {
 			cfg.LocalMergeDelayMinutes = tt.delay
 
 			client := ghclient.NewWithTransport("test-token", cfg, rt)
-			ag := agent.NewCloudAgent(client)
+			ag := agent.NewCloudAgent(client, cfg)
 			p := poller.New(cfg, client, "test-token", ag)
 
 			task := &poller.PRTask{
@@ -165,6 +185,7 @@ func TestPRTask_ResolveConflictsLocally(t *testing.T) {
 				Num:         123,
 				Sha:         "head-sha", // Set a SHA
 				DisplayInfo: make(map[int]*poller.IssueDisplayInfo),
+				Manager:     &poller.AISessionManager{Slots: 1, Active: make(map[int]bool)},
 			}
 
 			// We call ResolveConflictsLocally and check the DisplayInfo.
@@ -193,7 +214,12 @@ func TestPRTask_ResolveConflictsLocally_Success(t *testing.T) {
 		path := r.URL.Path
 		if strings.Contains(path, "/issues/123/comments") {
 			marker := ghclient.SHAMarker("local-resolution-success", "head-sha")
-			_ = json.NewEncoder(w).Encode([]*github.IssueComment{{Body: github.Ptr(marker)}})
+			_ = json.NewEncoder(w).Encode([]*github.IssueComment{
+				{
+					Body:      github.Ptr(marker),
+					CreatedAt: &github.Timestamp{Time: time.Now()},
+				},
+			})
 		}
 	})
 	task := &poller.PRTask{
@@ -202,12 +228,14 @@ func TestPRTask_ResolveConflictsLocally_Success(t *testing.T) {
 		Num:         123,
 		Sha:         "head-sha",
 		DisplayInfo: make(map[int]*poller.IssueDisplayInfo),
+		Manager:     &poller.AISessionManager{Slots: 1, Active: make(map[int]bool)},
 	}
 
 	done, err := task.ResolveConflictsLocally(ctx, 0)
 	require.NoError(t, err)
 	assert.True(t, done)
 	assert.Contains(t, task.DisplayInfo[123].Current, "Merge resolved locally")
+	assert.NotEmpty(t, task.DisplayInfo[123].MergeLogPath)
 }
 
 // fakeRoundTripper and setupMockPoller are now in common_test.go

@@ -7,18 +7,20 @@ import (
 
 	"github.com/google/go-github/v68/github"
 
+	"github.com/BlackbirdWorks/copilot-autodev/config"
 	"github.com/BlackbirdWorks/copilot-autodev/ghclient"
 )
 
 // CloudAgent implements CodingAgent using the GitHub Copilot cloud API.
 // This is the default agent — it wraps the existing ghclient Copilot methods.
 type CloudAgent struct {
-	gh *ghclient.Client
+	gh  *ghclient.Client
+	cfg *config.Config
 }
 
 // NewCloudAgent creates a CloudAgent backed by the given GitHub client.
-func NewCloudAgent(gh *ghclient.Client) *CloudAgent {
-	return &CloudAgent{gh: gh}
+func NewCloudAgent(gh *ghclient.Client, cfg *config.Config) *CloudAgent {
+	return &CloudAgent{gh: gh, cfg: cfg}
 }
 
 func (a *CloudAgent) InvokeTask(
@@ -28,6 +30,10 @@ func (a *CloudAgent) InvokeTask(
 }
 
 func (a *CloudAgent) GetTaskStatus(ctx context.Context, jobID string) (*TaskStatus, error) {
+	if jobID == "" {
+		// Assignment trigger doesn't have a job ID. Return a placeholder status.
+		return &TaskStatus{Status: "requested"}, nil
+	}
 	status, err := a.gh.GetCopilotJobStatus(ctx, jobID)
 	if err != nil {
 		return nil, err
@@ -43,8 +49,12 @@ func (a *CloudAgent) GetTaskStatus(ctx context.Context, jobID string) (*TaskStat
 }
 
 func (a *CloudAgent) IsActive(ctx context.Context, issueNum int, branch string) bool {
-	jobID, _ := a.gh.LatestCopilotJobID(ctx, issueNum)
+	jobID, startedAt, _ := a.gh.LatestCopilotJobID(ctx, issueNum)
 	if jobID != "" {
+		if !startedAt.IsZero() && time.Since(startedAt) > time.Hour {
+			// Hard timeout: AI session lost track or stuck for > 1 hour
+			return false
+		}
 		status, err := a.gh.GetCopilotJobStatus(ctx, jobID)
 		if err == nil && status != nil {
 			s := status.Status
@@ -53,10 +63,26 @@ func (a *CloudAgent) IsActive(ctx context.Context, issueNum int, branch string) 
 				return true
 			}
 		}
+	} else if a.cfg.AssignInsteadOfInvoke {
+		// If no job ID but assignment trigger is enabled, check if the issue
+		// is still assigned to copilot.
+		if assigned, _ := a.gh.IsIssueAssignedTo(ctx, issueNum, "github-copilot"); assigned {
+			return true
+		}
 	}
 	if active, err := a.gh.HasActiveCopilotRunForBranch(ctx, branch); err == nil && active {
+		// Note: we could also check the workflow run's age here, but usually GitHub caps them at 1h.
 		return true
 	}
+
+	// Check if Copilot is engaged via reaction to a recent prompt but hasn't responded yet.
+	if engaged, reactedAt, _ := a.gh.CopilotEngagementStatus(ctx, issueNum); engaged {
+		if !reactedAt.IsZero() && time.Since(reactedAt) > time.Hour {
+			return false // Hard timeout
+		}
+		return true
+	}
+
 	return false
 }
 

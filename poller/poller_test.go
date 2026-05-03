@@ -247,7 +247,8 @@ func TestPoller_ProcessCodingPR(t *testing.T) {
 				Head:   &github.PullRequestBranch{SHA: github.Ptr("sha")},
 			}
 			displayInfo := make(map[int]*poller.IssueDisplayInfo)
-			err := p.ProcessCodingPR(ctx, pr, 123, displayInfo)
+			manager := &poller.AISessionManager{Slots: 1, Active: make(map[int]bool)}
+			err := p.ProcessCodingPR(ctx, pr, 123, displayInfo, manager)
 			assert.NoError(t, err)
 		})
 	}
@@ -292,7 +293,8 @@ func TestPoller_ProcessDraftPR(t *testing.T) {
 				w.WriteHeader(http.StatusOK)
 			})
 			displayInfo := make(map[int]*poller.IssueDisplayInfo)
-			err := p.ProcessDraftPR(ctx, tt.args.pr, 123, displayInfo)
+			manager := &poller.AISessionManager{Slots: 1, Active: make(map[int]bool)}
+			err := p.ProcessDraftPR(ctx, tt.args.pr, 123, displayInfo, manager)
 			assert.NoError(t, err)
 			assert.Contains(t, displayInfo[123].Current, tt.wants.expectStatus)
 		})
@@ -367,8 +369,9 @@ func TestPoller_PromoteFromQueue(t *testing.T) {
 				}
 			})
 			p.Cfg().MaxConcurrentIssues = tt.args.maxConcurrent
+			manager := &poller.AISessionManager{Slots: tt.args.maxConcurrent, Active: make(map[int]bool)}
 
-			err := p.PromoteFromQueue(ctx, tt.args.queueIssues)
+			err := p.PromoteFromQueue(ctx, tt.args.queueIssues, len(tt.args.codingIssues), len(tt.args.reviewIssues), manager)
 			assert.NoError(t, err)
 		})
 	}
@@ -475,7 +478,8 @@ func TestPoller_ProcessCodingIssue(t *testing.T) {
 				Labels: []*github.Label{{Name: github.Ptr("ai-coding")}},
 			}
 			displayInfo := make(map[int]*poller.IssueDisplayInfo)
-			p.ProcessCodingIssue(ctx, issue, displayInfo)
+			manager := &poller.AISessionManager{Slots: 1, Active: make(map[int]bool)}
+			p.ProcessCodingIssue(ctx, issue, displayInfo, manager)
 		})
 	}
 }
@@ -550,8 +554,9 @@ func TestPoller_ProcessOne_NoPR(t *testing.T) {
 					w.WriteHeader(http.StatusOK)
 				}
 			})
-
-			err := p.ProcessOne(ctx, tt.args.issue, tt.args.displayInfo)
+			displayInfo := make(map[int]*poller.IssueDisplayInfo)
+			manager := &poller.AISessionManager{Slots: 1, Active: make(map[int]bool)}
+			err := p.ProcessOne(ctx, tt.args.issue, displayInfo, manager)
 			if tt.wants.err {
 				assert.Error(t, err)
 			} else {
@@ -794,7 +799,8 @@ func TestPoller_ProcessCodingPR_TableDriven(t *testing.T) {
 				Number: tt.args.issue.Number,
 				Head:   &github.PullRequestBranch{SHA: github.Ptr("sha")},
 			}
-			err := p.ProcessCodingPR(ctx, pr, tt.args.issue.GetNumber(), displayInfo)
+			manager := &poller.AISessionManager{Slots: 1, Active: make(map[int]bool)}
+			err := p.ProcessCodingPR(ctx, pr, tt.args.issue.GetNumber(), displayInfo, manager)
 			if tt.wants.err {
 				assert.Error(t, err)
 			} else {
@@ -855,7 +861,8 @@ func TestPoller_ProcessOne(t *testing.T) {
 			t.Parallel()
 			p := setupMockPoller(t, tt.args.mockHandler)
 			displayInfo := make(map[int]*poller.IssueDisplayInfo)
-			err := p.ProcessOne(ctx, tt.args.issue, displayInfo)
+			manager := &poller.AISessionManager{Slots: 1, Active: make(map[int]bool)}
+			err := p.ProcessOne(ctx, tt.args.issue, displayInfo, manager)
 			if tt.wants.err {
 				assert.Error(t, err)
 			} else {
@@ -993,6 +1000,7 @@ func TestPoller_NudgeSingleCodingIssue(t *testing.T) {
 	t.Parallel()
 
 	type args struct {
+		issue       *github.Issue
 		mockHandler func(w http.ResponseWriter, r *http.Request)
 	}
 	type wants struct {
@@ -1007,6 +1015,7 @@ func TestPoller_NudgeSingleCodingIssue(t *testing.T) {
 		{
 			name: "no coding label yet",
 			args: args{
+				issue: &github.Issue{Number: github.Ptr(123)},
 				mockHandler: func(w http.ResponseWriter, r *http.Request) {
 					if strings.Contains(r.URL.Path, "/issues/123/events") {
 						_ = json.NewEncoder(w).Encode([]*github.IssueEvent{})
@@ -1021,6 +1030,7 @@ func TestPoller_NudgeSingleCodingIssue(t *testing.T) {
 		{
 			name: "waiting for timeout",
 			args: args{
+				issue: &github.Issue{Number: github.Ptr(123)},
 				mockHandler: func(w http.ResponseWriter, r *http.Request) {
 					if strings.Contains(r.URL.Path, "/issues/123/events") {
 						_ = json.NewEncoder(w).Encode([]*github.IssueEvent{
@@ -1043,6 +1053,7 @@ func TestPoller_NudgeSingleCodingIssue(t *testing.T) {
 		{
 			name: "agent exhausted retries",
 			args: args{
+				issue: &github.Issue{Number: github.Ptr(123)},
 				mockHandler: func(w http.ResponseWriter, r *http.Request) {
 					if strings.Contains(r.URL.Path, "/issues/123/events") {
 						_ = json.NewEncoder(w).Encode([]*github.IssueEvent{
@@ -1083,10 +1094,10 @@ func TestPoller_NudgeSingleCodingIssue(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			p := setupMockPoller(t, tt.args.mockHandler)
-			issue := &github.Issue{Number: github.Ptr(123)}
 			displayInfo := make(map[int]*poller.IssueDisplayInfo)
 
-			err := p.NudgeSingleCodingIssue(t.Context(), issue, displayInfo, 10*time.Minute)
+			manager := &poller.AISessionManager{Slots: 1, Active: make(map[int]bool)}
+			err := p.NudgeSingleCodingIssue(t.Context(), tt.args.issue, displayInfo, 10*time.Second, manager)
 			if tt.wants.expectError {
 				assert.Error(t, err)
 			} else {
@@ -1305,7 +1316,8 @@ func TestPoller_ProcessOne_MissingPR(t *testing.T) {
 					w.WriteHeader(http.StatusOK)
 				}
 			})
-			err := p.ProcessOne(t.Context(), tt.args.issue, tt.args.displayInfo)
+			manager := &poller.AISessionManager{Slots: 1, Active: make(map[int]bool)}
+			err := p.ProcessOne(t.Context(), tt.args.issue, tt.args.displayInfo, manager)
 			if tt.wants.err {
 				assert.Error(t, err)
 			} else {

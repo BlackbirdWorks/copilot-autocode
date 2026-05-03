@@ -357,9 +357,9 @@ func TestLatestCopilotJobID_Success(t *testing.T) {
 			}})
 		}
 	})
-	id, err := c.LatestCopilotJobID(t.Context(), 123)
+	jobID, _, err := c.LatestCopilotJobID(t.Context(), 123)
 	require.NoError(t, err)
-	assert.Equal(t, "abc-123", id)
+	assert.Equal(t, "abc-123", jobID)
 }
 
 func TestLatestWorkflowRun_Success(t *testing.T) {
