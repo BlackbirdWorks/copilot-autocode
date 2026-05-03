@@ -353,6 +353,71 @@ func TestCLIAgent_SendPrompt_SuccessBranches(t *testing.T) {
 	}
 }
 
+func TestCLIAgent_UsesPhaseSpecificModels(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+
+	cfg := config.DefaultConfig()
+	cfg.GitHubOwner = "owner"
+	cfg.GitHubRepo = "repo"
+	cfg.CLIAgentCmd = "claude"
+	cfg.CLIAgentArgs = []string{"-p", "{prompt}", "--model", "{model}"}
+	cfg.CLIAgentInitialModel = "opus-4.7"
+	cfg.CLIAgentRefinementModel = "sonnet"
+	cfg.CLIAgentCIFixModel = "sonnet"
+
+	rt := &fakeRoundTripper{
+		handler: func(r *http.Request) (*http.Response, error) {
+			rec := httptest.NewRecorder()
+			switch {
+			case strings.Contains(r.URL.Path, "/pulls/456") && r.Method == http.MethodGet:
+				_ = json.NewEncoder(rec).Encode(&github.PullRequest{
+					Number: github.Ptr(456),
+					Head:   &github.PullRequestBranch{Ref: github.Ptr("feature-branch")},
+					Base:   &github.PullRequestBranch{Ref: github.Ptr("main")},
+				})
+			default:
+				_ = json.NewEncoder(rec).Encode(&github.Issue{Number: github.Ptr(123)})
+			}
+			return rec.Result(), nil
+		},
+	}
+	client := ghclient.NewWithTransport("token", cfg, rt)
+	runner := &mockRunner{
+		runFunc: func(_ context.Context, _, _, _ string, _ ...string) error {
+			return nil
+		},
+		outputFunc: func(_ context.Context, _, name string, args ...string) (string, error) {
+			if name == "git" && args[0] == "rev-parse" {
+				return "same-sha", nil
+			}
+			if name == "git" && args[0] == "diff" {
+				return "changed.go", nil
+			}
+			return "", nil
+		},
+	}
+
+	ag := agent.NewCLIAgentWithRunner(client, cfg, "token", runner)
+	_, err := ag.InvokeTask(ctx, "build it", "title", 123, "url")
+	require.NoError(t, err)
+	assert.Eventually(t, func() bool {
+		return !ag.IsActive(ctx, 123, "branch")
+	}, time.Second, 10*time.Millisecond)
+
+	err = ag.SendPrompt(ctx, agent.PromptRequest{
+		PRNum:      456,
+		PromptType: "ci-fix",
+		Body:       "fix ci",
+	})
+	require.NoError(t, err)
+
+	joined := strings.Join(runner.calls, "\n")
+	assert.Contains(t, joined, "build it")
+	assert.Contains(t, joined, "--model opus-4.7")
+	assert.Contains(t, joined, "claude -p fix ci --model sonnet")
+}
+
 func TestRealRunner(t *testing.T) {
 	t.Parallel()
 	rr := &agent.RealRunner{}
